@@ -28,7 +28,7 @@ Our solution can handle **rough initial pose**, allows **robust localization**, 
 
 ### Contributors
 
-[Yihao Xu 许益豪](https://github.com/liaraaaaaaa), Xin Li 李鑫, Zhongxia Zhao 赵仲夏
+[Yihao Xu 许益豪](https://github.com/liaraaaaaaa), Xin Li 李鑫, [Zhongxia Zhao 赵仲夏](https://github.com/xiaranqing), Gaohao Zhou 周高豪, Xiang An 安翔, Ziyong Feng 冯子勇
 
 ## 1. Prerequisites
 ### 1.1 Ubuntu and ROS
