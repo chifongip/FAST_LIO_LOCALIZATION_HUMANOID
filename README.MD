@@ -86,7 +86,7 @@ mkdir -p ~/ws_loc/src
 
 #Get code
 cd ~/ws_loc/src
-git clone xxx
+git clone https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID.git
 cd ..
 
 #Build
