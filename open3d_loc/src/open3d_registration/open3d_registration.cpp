@@ -72,8 +72,6 @@ namespace pcd_tools
                 *source_transformed, *target, icp_distance_threshold, Eigen::Matrix4d::Identity(),
                 open3d::pipelines::registration::TransformationEstimationForGeneralizedICP(), _criteria_icp);
         }
-        // std::cout << "icp registration_result.transformation_: \n"
-        //           << registration_result.transformation_ << std::endl;
         return registration_result;
     }
 
@@ -91,49 +89,9 @@ namespace pcd_tools
 
         std::chrono::high_resolution_clock::time_point preprocess_all_s = std::chrono::high_resolution_clock::now();
         std::vector<PcdPair> vec_pcd_pair;
-        // if (multi_scale)
-        // {
-        //     std::cout << "multi scale icp ON" << std::endl;
-        //     // vec_pcd_pair.resize(3);
-        //     // vec_pcd_pair[0].voxel_size_ = voxel_size / 2.0;
-        //     // vec_pcd_pair[0].icp_threshold_ = vec_pcd_pair[0].voxel_size_ * 1.5;
-
-        //     // vec_pcd_pair[1].voxel_size_ = voxel_size;
-        //     // vec_pcd_pair[1].icp_threshold_ = vec_pcd_pair[1].voxel_size_ * 1.5;
-
-        //     // vec_pcd_pair[2].voxel_size_ = voxel_size;
-        //     // vec_pcd_pair[2].icp_threshold_ = vec_pcd_pair[2].voxel_size_ * 4;
-
-        //     // PcdPair pair_0;
-        //     // pair_0.voxel_size_ = voxel_size / 2.0;
-        //     // pair_0.icp_threshold_ = pair_0.voxel_size_ * 1.5;
-        //     // vec_pcd_pair.push_back(pair_0);
-
-        //     PcdPair pair_1;
-        //     pair_1.voxel_size_ = voxel_size;
-        //     pair_1.icp_threshold_ = pair_1.voxel_size_ * 1.5;
-        //     vec_pcd_pair.push_back(pair_1);
-        //     std::cout << " voxel_size: " << pair_1.voxel_size_ << std::endl;
-
-        //     PcdPair pair_2;
-        //     pair_2.voxel_size_ = voxel_size;
-        //     pair_2.icp_threshold_ = pair_2.voxel_size_ * 3;
-        //     vec_pcd_pair.push_back(pair_2);
-        //     std::cout << " voxel_size: " << pair_2.voxel_size_ << std::endl;
-
-        // }
-        // else
-        // {
-        //     std::cout << "multi scale icp OFF" << std::endl;
-        //     PcdPair pair_;
-        //     pair_.voxel_size_ = voxel_size;
-        //     pair_.icp_threshold_ = pair_.voxel_size_ * 1.5;
-        //     vec_pcd_pair.push_back(pair_);
-        // }
 
         for (std::size_t scale_i = 0; scale_i < scale.size(); ++scale_i)
         {
-            // open3d::utility::LogInfo("scale: {}, voxel size: {}, scale value: {}", scale_i, voxel_size, scale[scale_i]);
             PcdPair pair_;
             pair_.voxel_size_ = voxel_size * scale[scale_i];
             pair_.icp_threshold_ = pair_.voxel_size_ * 1.5;
@@ -147,17 +105,13 @@ namespace pcd_tools
             std::chrono::high_resolution_clock::time_point preprocess_s = std::chrono::high_resolution_clock::now();
             double voxel_size_ = vec_pcd_pair[pcd_i].voxel_size_;
             std::cout << "scale i: " << pcd_i << " voxel_size: " << voxel_size_ << std::endl;
-            // pcd_pair pcd_pair_current;
             vec_pcd_pair[pcd_i].pcd_src = source->VoxelDownSample(voxel_size_);
             vec_pcd_pair[pcd_i].pcd_tgt = target->VoxelDownSample(voxel_size_);
-            // vec_pcd_pair[pcd_i].pcd_src->EstimateNormals(
-            //     open3d::geometry::KDTreeSearchParamHybrid(voxel_size_ * 2, 30));
             vec_pcd_pair[pcd_i].pcd_tgt->EstimateNormals(
                 open3d::geometry::KDTreeSearchParamHybrid(voxel_size_ * 2, 30));
 
             std::chrono::high_resolution_clock::time_point preprocess_e = std::chrono::high_resolution_clock::now();
             auto preprocess_cost = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_e - preprocess_s).count();
-            // std::cout << "scale " << pcd_i << " cost: " << preprocess_cost << " ms" << std::endl;
         };
 
         std::vector<std::thread> thread_preprocess;
@@ -171,7 +125,6 @@ namespace pcd_tools
         }
         std::chrono::high_resolution_clock::time_point preprocess_all_e = std::chrono::high_resolution_clock::now();
         auto preprocess_all_cost = std::chrono::duration_cast<std::chrono::milliseconds>(preprocess_all_e - preprocess_all_s).count();
-        // std::cout << "preprocess_all cost: " << preprocess_all_cost << " ms" << std::endl;
 
         // /*配准*/
         open3d::pipelines::registration::RegistrationResult registration_result;
@@ -190,10 +143,8 @@ namespace pcd_tools
             registration_result = RegistrationIcp(src, tgt, icp_threshold_current, matrix_icp, icp_method, 30);
             matrix_icp = registration_result.transformation_ * matrix_icp;
         }
-        // ROS_INFO("icp optimation times: %d, final icp_distance_threshold: %f", count_icp, icp_threshold_current);
         std::chrono::high_resolution_clock::time_point icp_e = std::chrono::high_resolution_clock::now();
         auto icp_cost = std::chrono::duration_cast<std::chrono::milliseconds>(icp_e - icp_s).count();
-        // std::cout << "RegistrationMultiScaleIcp cost: " << icp_cost << " ms" << std::endl;
 
         return matrix_icp;
     }
@@ -284,9 +235,7 @@ namespace pcd_tools
         path_source = "";
         path_target = "";
         voxel_size = 0.05;
-        // distance_threshold = voxel_size * 1.5;
         icp_iteration = 30;
-        // icp_distance_threshold = voxel_size * 1.5;
         icp_method = 1;
 
         seed_ = open3d::utility::nullopt;
@@ -297,11 +246,7 @@ namespace pcd_tools
         icp_matrix = Eigen::Matrix4d::Identity();
         final_transformation = Eigen::Matrix4d::Identity();
 
-        // std::cout << "ptr source: " << source << std::endl;
         source.reset(new open3d::geometry::PointCloud);
-        // std::cout << "distance_threshold: " << &distance_threshold << std::endl;
-        // std::cout << "initial_matrix: " << &initial_matrix << std::endl;
-        // std::cout << "ptr source: " << &source << std::endl;
 
         target.reset(new open3d::geometry::PointCloud);
         source_ori.reset(new open3d::geometry::PointCloud);
@@ -329,9 +274,6 @@ namespace pcd_tools
             std::cout << "no data in pcd" << std::endl;
             return std::make_tuple(pcd, std::make_shared<open3d::pipelines::registration::Feature>());
         }
-        // std::cout << "PreprocessPointCloud:\n"
-        //           << "voxel_size: " << voxel_size << (filter ? "\nfilter true" : "filter false\n")
-        //           << "cropbox extent.x: " << cropbox.extent_[0] << std::endl;
 
         *pcd = pcd->RemoveNonFinitePoints(true, true);
 
@@ -344,18 +286,14 @@ namespace pcd_tools
         // 2、statistical filter
         if (filter)
         {
-            // std::cout << "[PreprocessPointCloud] before filter: " << pcd->points_.size() << " points" << std::endl;
             auto sta_filered = pcd->RemoveStatisticalOutliers(neighbors, std_ratio, false);
             pcd = std::get<0>(sta_filered);
-            // std::cout << "[PreprocessPointCloud] after filter: " << pcd->points_.size() << " points" << std::endl;
         }
         // 3、降采样
         if (voxel_downsample)
         {
 
             pcd = pcd->VoxelDownSample(voxel_size);
-            // std::cout << "[PreprocessPointCloud] voxel_size=" << voxel_size << ", after downsample "
-            //           << pcd->points_.size() << "points left" << std::endl;
         }
         // 4、计算法向量
 
@@ -408,10 +346,7 @@ namespace pcd_tools
             open3d::pipelines::registration::RegistrationResult registration_result;
             registration_result = pcd_tools::RegistrationFpfh(source, target, source_fpfh, target_fpfh, voxel_size, seed_, true);
             fpfh_matrix = registration_result.transformation_;
-            // std::cout << "*****fpfh_result*****\n";
-            // PrintRegistrationResult(registration_result);
             std::chrono::high_resolution_clock::time_point fpfh_time_e = std::chrono::high_resolution_clock::now();
-            // std::cout << "fpfh coarse registration costs: " << std::chrono::duration_cast<std::chrono::milliseconds>(fpfh_time_e - fpfh_time_s).count() / 1000.0 << " s" << std::endl;
         }
 
         if (use_icp)
@@ -421,15 +356,12 @@ namespace pcd_tools
             icp_matrix = pcd_tools::RegistrationMultiScaleIcp(source, target, voxel_size, icp_method);
             final_transformation = icp_matrix * fpfh_matrix * initial_matrix;
             std::chrono::high_resolution_clock::time_point icp_time_e = std::chrono::high_resolution_clock::now();
-            // std::cout << "registration RegistrationMultiScaleIcp costs: " << std::chrono::duration_cast<std::chrono::milliseconds>(icp_time_e - icp_time_s).count() / 1000.0 << " s" << std::endl;
         }
 
         // 计算最终的结果
-        // regresult = open3d::pipelines::registration::EvaluateRegistration(*source_ori, *target_ori, voxel_size * 1.5, final_transformation);
         regresult = RegistrationEvaluate(source_ori, target_ori, voxel_size, final_transformation);
         overlap = regresult.fitness_;
         std::chrono::high_resolution_clock::time_point total_time = std::chrono::high_resolution_clock::now();
-        // std::cout << "registration total_time costs: " << std::chrono::duration_cast<std::chrono::milliseconds>(total_time - start_time).count() / 1000.0 << " s" << std::endl;
 
         return true;
     }

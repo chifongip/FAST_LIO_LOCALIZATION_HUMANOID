@@ -28,7 +28,7 @@ Our solution can handle **rough initial pose**, allows **robust localization**, 
 
 ### Contributors
 
-[Yihao Xu 许益豪](https://github.com/liaraaaaaaa), Xin Li 李鑫, [Zhongxia Zhao 赵仲夏](https://github.com/xiaranqing), Gaohao Zhou 周高豪, Xiang An 安翔, Ziyong Feng 冯子勇
+[Yihao Xu 许益豪](https://github.com/liaraaaaaaa), [Xin Li 李鑫](https://github.com/carlos-lee123), [Zhongxia Zhao 赵仲夏](https://github.com/xiaranqing), Gaohao Zhou 周高豪, Dongliang Li 李栋梁, [Xiang An 安翔](https://github.com/anxiangsir), Ziyong Feng 冯子勇
 
 ## 1. Prerequisites
 ### 1.1 Ubuntu and ROS
@@ -147,6 +147,13 @@ roslaunch livox_ros_driver2 msg_MID360.launch
 source devel/setup.bash
 roslaunch fast_lio mapping_mid360_g1.launch
 ```
+
+Rviz interface of fast_lio consumes some memory, which you can turn off by setting ```rviz``` to "false" in [FAST_LIO/launch/mapping_mid360_g1.launch](FAST_LIO/launch/mapping_mid360_g1.launch)
+```
+<!-- <arg name="rviz" default="true" /> -->
+<arg name="rviz" default="false" />
+```
+
 ### 4.3 open3d_loc
 ```
 source devel/setup.bash

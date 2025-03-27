@@ -409,18 +409,11 @@ void GloabalLocalization::CallbackBaselink2Odom(
     lock_timestamp_.lock();
     timestamp_odom_ = baselink2odom->header.stamp;
     lock_timestamp_.unlock();
-    // std::cout << "baselink2odom: parent: " << baselink2odom->header.frame_id << " child: " << baselink2odom->child_frame_id << std::endl;
     Eigen::Isometry3d mat_current = Eigen::Isometry3d::Identity();
     tf::poseMsgToEigen(baselink2odom->pose.pose, mat_current);
     auto mat_imulink2odom = mat_current.matrix();
 
-    /// mat_baselink2odom_ = mat_imulink2odom * baselink2imulink
     mat_baselink2odom_ = mat_imulink2odom * mat_imulink2baselink_.inverse();
-    // ROS_INFO("baselink2odom x: %f, y: %f, z: %f",
-    //          mat_baselink2odom_(0, 3),
-    //          mat_baselink2odom_(1, 3),
-
-    //          mat_baselink2odom_(2, 3));
 
     Eigen::Isometry3d Isometry3d_baselink2map;
     mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
@@ -517,13 +510,6 @@ void GloabalLocalization::CallbackBaselink2Odom(
         transform.setRotation(q);
         br.sendTransform(tf::StampedTransform(transform, baselink2odom->header.stamp, "map", "motion_link"));
 
-        /// 发布motionlink2map
-        // localization_3d_.confidence = loc_fitness_;
-        // localization_3d_.delay_ms = (ros::Time::now().toSec() - baselink2odom->header.stamp.toSec()) * 1000.0;
-        // localization_3d_.localization.header.frame_id = "map";
-        // localization_3d_.localization.header.stamp = baselink2odom->header.stamp;
-        // localization_3d_.localization.pose = motionlink2map.pose.pose;
-
         localization_3d_confidence_.data = loc_fitness_;
         pub_localization_3d_confidence_.publish(localization_3d_confidence_);
         localization_3d_delay_ms_.data = (ros::Time::now().toSec() - baselink2odom->header.stamp.toSec()) * 1000.0;
@@ -533,19 +519,10 @@ void GloabalLocalization::CallbackBaselink2Odom(
         localization_3d_.pose = motionlink2map.pose.pose;
         pub_localization_3d_.publish(localization_3d_);
     }
-    // auto odom_cbk_e = std::chrono::high_resolution_clock::now();
-    // auto odom_cbk_cost = std::chrono::duration_cast<std::chrono::microseconds>(odom_cbk_e - odom_cbk_s).count() / 1000.0;
-    // std::cout << "odom_cbk_cost: " << odom_cbk_cost<<" ms" << std::endl; ///小于1ms
 }
 void GloabalLocalization::CallbackScan(
     const sensor_msgs::PointCloud2::ConstPtr &scan_in_baselink)
 {
-    // /// 不需要更新感知子图，并且队列中帧数足够时返回(一开始帧数没达到，不管更不更新感知子图，都要先把队列填满)
-    // if (!need_update_submap_ && que_pcd_scan_.size() >= queue_maxsize_)
-    // {
-    //     std::cout << "need_update_submap_: " << (need_update_submap_ ? "true" : "false") << "   que_pcd_scan_.size(): " << que_pcd_scan_.size() << std::endl;
-    //     return;
-    // }
     auto cbk_s = std::chrono::high_resolution_clock::now();
     open3d::geometry::PointCloud pcd_recieved;
     // 单帧转换为open3d，几百us
@@ -576,9 +553,6 @@ void GloabalLocalization::CallbackScan(
     que_pcd_scan_.push(pcd_recieved);
 
     auto cbk_e = std::chrono::high_resolution_clock::now();
-    // auto cbk_cost = std::chrono::duration_cast<std::chrono::microseconds>(cbk_e - cbk_s).count() / 1000.0;
-    // ROS_INFO("que_pcd_scan_ size: %d, pcd_scan_cur_: %d, cost: %f ms",
-    //          que_pcd_scan_.size(), pcd_scan_cur_->points_.size(), cbk_cost);
 }
 
 void GloabalLocalization::LocalizationInitialize()
@@ -638,7 +612,6 @@ void GloabalLocalization::LocalizationInitialize()
             OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
             OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
             OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
-            // *map_coarse_crop = *pcd_map_coarse_->Crop(*OBB_map);
             *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
 
             /// 配准计时
@@ -706,14 +679,12 @@ void GloabalLocalization::Localization()
     ros::topic::waitForMessage<nav_msgs::Odometry>("/Odometry_loc");
     ROS_INFO("wait for cloud_registered_1");
     ros::topic::waitForMessage<sensor_msgs::PointCloud2>("/cloud_registered_1");
-    // Euler2Matrix3d(Eigen::Vector3d::Identity());
     // initialize
     /****初始化定位****/
     mat_odom2map_ = mat_initialpose_; /// 初始位姿，从目前是从配置文件给
     LocalizationInitialize();
 
     /// 卡尔曼滤波初始化
-    // kalman_filter_.KalmanFilterInit(kalman_processVar_, kalman_estimatedMeasVar_, 0, 1);
     kf_baselink_x_.KalmanFilterInit(kf_param_x_[0], kf_param_x_[1], mat_baselink2map_(0, 3), 1);
     kf_baselink_y_.KalmanFilterInit(kf_param_y_[0], kf_param_y_[1], mat_baselink2map_(1, 3), 1);
     kf_baselink_z_.KalmanFilterInit(kf_param_z_[0], kf_param_z_[1], mat_baselink2map_(2, 3), 1);
@@ -745,12 +716,6 @@ void GloabalLocalization::Localization()
 
     ROS_INFO("time_last: %f", time_last.toSec());
     ROS_INFO("time_current: %f", time_current.toSec());
-    // double time_diff = time_current.toSec() - time_last.toSec();
-    // ROS_INFO("time_diff: %f", time_diff);
-
-    // std::chrono::high_resolution_clock::time_point time_current;
-    // std::chrono::high_resolution_clock::time_point time_last;
-    // double time_diff = 10.0;
     int scan_count = 0;
 
     std::string save_path = "/home/carlos/mount/E/lixin/data/yq_bag/scan_submap/";
@@ -766,12 +731,9 @@ void GloabalLocalization::Localization()
         time_current = timestamp_odom_;
         lock_timestamp_.unlock();
         auto time_diff_frame = time_current.toSec() - time_last.toSec();
-        // time_current = std::chrono::high_resolution_clock::now();
-        // time_last = time_current - std::chrono::seconds(3);
         time_last = time_current;
         if (std::fabs(time_diff_frame) < 1e-6)
         {
-            // ROS_WARN("no new odom");
             loc_cost = 0.0;
             continue;
         }
@@ -832,7 +794,6 @@ void GloabalLocalization::Localization()
                 OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
 
                 /// 粗地图和精地图
-                // *map_coarse_crop = *pcd_map_coarse_->Crop(*OBB_map);
                 *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
 
                 auto submap_e = std::chrono::high_resolution_clock::now();
@@ -842,7 +803,6 @@ void GloabalLocalization::Localization()
 
             OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
             OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
-            // *pcd_scancrop = *pcd_scan->Crop(*OBB_scan);
 
             auto reg0_s = std::chrono::high_resolution_clock::now();
 
@@ -911,7 +871,6 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::PoseWithCovar
               << mat_odom2map_ << std::endl;
     std::cout << "confidence_loc_th_: " << confidence_loc_th_ << " current confidence: " << loc_fitness_ << std::endl;
 
-    // if (!(loc_initialized_ && loc_fitness_ > confidence_loc_th_ + 0.2))
     if (!(loc_initialized_ && loc_fitness_ > 0.99))
     {
         std::cout << "initpose:x y z, x y z w\n"
