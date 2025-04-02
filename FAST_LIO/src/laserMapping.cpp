@@ -755,7 +755,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "laserMapping");
+    ros::init(argc, argv, "fast_lio_node");
     ros::NodeHandle nh;
 
     nh.param<bool>("publish/path_en",path_en, true);

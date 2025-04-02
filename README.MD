@@ -137,36 +137,34 @@ We do not provide specific mapping solutions, but recommend a few open-source ma
 Recommend [CloudCompare](https://github.com/CloudCompare/CloudCompare) to fine tune pointcloud maps, such as aligning the ground or cropping out people's shadows.
 
 (If we can get 100 stars, we will urge other colleagues to simplify and open source our mapping solutions for large-scale scenarios)
-### 4.1 livox_ros_driver2
-```
-source devel/setup.bash
-roslaunch livox_ros_driver2 msg_MID360.launch
-```
-### 4.2 fast_lio
-```
-source devel/setup.bash
-roslaunch fast_lio mapping_mid360_g1.launch
-```
 
-Rviz interface of fast_lio consumes some memory, which you can turn off by setting ```rviz``` to "false" in [FAST_LIO/launch/mapping_mid360_g1.launch](FAST_LIO/launch/mapping_mid360_g1.launch)
+
+### 4.1 open3d_loc & fast_lio
+```
+source devel/setup.bash
+roslaunch open3d_loc localization_3d_g1.launch
+```
+[open3d_loc/launch/localization_3d_g1.launch](open3d_loc/launch/localization_3d_g1.launch) starts ```open3d_loc``` and ```fast_lio``` at the same time.
+
+```Rviz``` of fast_lio consumes some memory, so we disable ```rviz``` of ```fast_lio``` by default in [FAST_LIO/launch/mapping_mid360_g1.launch](FAST_LIO/launch/mapping_mid360_g1.launch)
 ```
 <!-- <arg name="rviz" default="true" /> -->
 <arg name="rviz" default="false" />
 ```
 
-### 4.3 open3d_loc
-```
-source devel/setup.bash
-roslaunch open3d_loc localization_3d_g1.launch
-```
-### 4.4 initial pose
+### 4.2 initial pose
 In **rviz**, click **2D Pose Estimate**, and determine a position and orientation on the pointcloud map by **green arrow**.
 <div align="center">
 <img src="doc/initial_pose.jpg" width=75% />
 </div>
 
+### 4.3 livox_ros_driver2
+```
+source devel/setup.bash
+roslaunch livox_ros_driver2 msg_MID360.launch
+```
 
-### 4.5 rosbag
+### 4.4 rosbag
 If you need to run based on rosbag, do not need to roslaunch **livox_ros_driver2**.However, rosbag must also be collected using our **modified livox_ros_driver2**.
 
 ```
@@ -179,6 +177,19 @@ If you need to check the delay time, set ```use_sim_time``` to "true" in [FAST_L
 #For example
 rosbag play xxx.bag --clock
 ```
+
+### 4.5 check by rqt_graph
+
+Roslaunch the above node, in the newly opened terminal check by following command.
+
+```
+rqt_graph
+```
+The correct graph is as follows, this is the case with rosbag. If you use livox_ros_driver2 directly, ```/livox_lidar_publisher2``` will replace ```/play_xxx``` in the graph.
+
+<div align="center">
+<img src="doc/rqt_graph.jpg" width=85% />
+</div>
 
 ## 5. Result
 
