@@ -123,7 +123,7 @@ The default parameter configuration is OK.
 
 If you need to modify parameters, follow the [FAST_LIO](FAST_LIO/README.md).
 ### 3.3 open3d_loc
-Place your pointcloud map in the [data](data) folder and rename it to map.ply, or change the ```path_map``` in [open3d_loc/launch/open3d_loc_g1.launch](open3d_loc/launch/open3d_loc_g1.launch) to your pointcloud map's location.Both ```.pcd``` and ```.ply``` formats are acceptable.
+Place your pointcloud map in the [data](data) folder, and  change the ```path_map``` in [open3d_loc/launch/open3d_loc_g1.launch](open3d_loc/launch/open3d_loc_g1.launch) to your pointcloud map's location. Both ```.pcd``` and ```.ply``` formats are acceptable.
 ```
 <param name="path_map" type="string" value="$(find open3d_loc)/../data/map.ply" />
 ```
