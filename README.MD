@@ -31,9 +31,9 @@ Our solution can handle **rough initial pose**, allows **robust localization**, 
 [Yihao Xu 许益豪](https://github.com/liaraaaaaaa), [Xin Li 李鑫](https://github.com/carlos-lee123), [Zhongxia Zhao 赵仲夏](https://github.com/xiaranqing), Gaohao Zhou 周高豪, Dongliang Li 李栋梁, [Xiang An 安翔](https://github.com/anxiangsir), Ziyong Feng 冯子勇，[Huajie Tan 谭桦杰](https://github.com/tanhuajie)
 
 If you use in an academic work, please cite:
-```
-Yihao Xu, Xin Li, Zhongxia Zhao, Gaohao Zhou, Dongliang Li, Xiang An, Ziyong Feng, Huajie Tan, (2025) FAST_LIO_LOCALIZATION_HUMANOID [Source code]. [URL](https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID).
-```
+
+Yihao Xu, Xin Li, Zhongxia Zhao, Gaohao Zhou, Dongliang Li, Xiang An, Ziyong Feng, Huajie Tan, (2025) FAST_LIO_LOCALIZATION_HUMANOID [Source code]. https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID.
+
 
 ## 1. Prerequisites
 ### 1.1 Ubuntu and ROS
