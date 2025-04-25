@@ -32,7 +32,7 @@ Our solution can handle **rough initial pose**, allows **robust localization**, 
 
 If you use in an academic work, please cite:
 
-Yihao Xu, Xin Li, Zhongxia Zhao, Gaohao Zhou, Dongliang Li, Xiang An, Ziyong Feng, Huajie Tan, (2025) FAST_LIO_LOCALIZATION_HUMANOID [Source code]. https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID.
+Yihao Xu, Xin Li, Zhongxia Zhao, Gaohao Zhou, Dongliang Li, Xiang An, Huajie Tan, Ziyong Feng, (2025) FAST_LIO_LOCALIZATION_HUMANOID [Source code]. https://github.com/deepglint/FAST_LIO_LOCALIZATION_HUMANOID.
 
 
 ## 1. Prerequisites
