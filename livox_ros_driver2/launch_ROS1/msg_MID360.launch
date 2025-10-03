@@ -11,7 +11,7 @@
 	<arg name="rviz_enable" default="false"/>
 	<arg name="rosbag_enable" default="false"/>
 	<arg name="cmdline_arg" default="$(arg bd_list)"/>
-	<arg name="msg_frame_id" default="livox_frame"/>
+	<arg name="msg_frame_id" default="mid360_link"/>
 	<arg name="lidar_bag" default="true"/>
 	<arg name="imu_bag" default="true"/>
 	<!--user configure parameters for ros end--> 
@@ -31,6 +31,36 @@
 	<node name="livox_lidar_publisher2" pkg="livox_ros_driver2"
 	      type="livox_ros_driver2_node" required="true"
 	      output="screen" args="$(arg cmdline_arg)"/>
+
+	<node pkg="livox_to_pointcloud2" type="livox_to_pointcloud2_node" name="livox_to_pointcloud2_node" />
+
+    <node pkg="pointcloud_to_laserscan" type="pointcloud_to_laserscan_node" name="pointcloud_to_laserscan_lidar">
+
+        <remap from="cloud_in" to="/livox/points"/>
+        <remap from="scan" to="/livox/scan"/>
+        <rosparam>
+            target_frame: pelvis
+            transform_tolerance: 0.5
+            min_height: -0.5
+            max_height: 0.5
+
+            angle_min: -3.1415
+            angle_max: 3.1415
+            angle_increment: 0.0087
+            scan_time: 0.1
+            range_min: 0.1
+            range_max: 5.0
+            use_inf: true
+            inf_epsilon: 1.0
+
+            # Concurrency level, affects number of pointclouds queued for processing and number of threads used
+            # 0 : Detect number of cores
+            # 1 : Single threaded
+            # 2-inf : Parallelism level
+            concurrency_level: 1
+        </rosparam>
+
+    </node>
 
 	<group if="$(arg rosbag_enable)">
     	<node pkg="rosbag" type="record" name="record" output="screen"
