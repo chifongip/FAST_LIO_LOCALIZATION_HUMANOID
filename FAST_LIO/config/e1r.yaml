@@ -1,0 +1,53 @@
+/**:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 3
+    max_iteration: 3
+    filter_size_surf: 0.5
+    filter_size_map: 0.5
+    cube_side_length: 1000.0
+    runtime_pos_log_enable: false
+    map_file_path: "./test.pcd"
+
+    common:
+      lid_topic: "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"
+      imu_topic: "/aima/hal/sensor/lidar_chest_front/imu"
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+
+    preprocess:
+      lidar_type: 5
+      scan_line: 96
+      scan_rate: 10
+      timestamp_unit: 3
+      max_scan_duration_ms: 200.0
+      blind: 0.5
+
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 100.0
+      extrinsic_est_en: false
+      # LiDAR pose in lidar_imu_chest_front, from the sensor's static TF.
+      extrinsic_T: [0.0042744, -0.0157518, -0.0112120]
+      extrinsic_R: [-0.006021249, -0.999937368, 0.009434273,
+                    0.006088156, 0.009397612, 0.999937308,
+                    -0.999963339, 0.006078308, 0.006031189]
+
+    publish:
+      tf_en: false
+      odom_frame: "camera_init"
+      body_frame: "lidar_imu_chest_front"
+      path_en: true
+      effect_map_en: false
+      map_en: true
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

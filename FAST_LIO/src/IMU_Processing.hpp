@@ -8,6 +8,7 @@
 #include <so3_math.h>
 #include <Eigen/Eigen>
 #include <common_lib.h>
+#include <gravity_alignment.h>
 #include <pcl/common/io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -190,9 +191,19 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
-  
-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+  M3D world_from_imu = M3D::Identity();
+  if (fast_lio::gravityAlignedWorldFromImu(mean_acc, world_from_imu))
+  {
+    // camera_init is gravity aligned: +Z is up and gravity is -Z.
+    init_state.rot = SO3(world_from_imu);
+    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  }
+  else
+  {
+    // Keep a finite state if IMU initialization received no usable acceleration.
+    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  }
+
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;

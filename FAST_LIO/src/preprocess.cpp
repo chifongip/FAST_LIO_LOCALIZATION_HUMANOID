@@ -1,11 +1,14 @@
 #include "preprocess.h"
 
+#include <algorithm>
+#include <limits>
 #include <pcl/common/common.h>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
-Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
+Preprocess::Preprocess()
+    : feature_enabled(0), lidar_type(AVIA), blind(0.01), max_scan_duration_ms(0.0), point_filter_num(1)
 {
   inf_bound = 10;
   N_SCANS = 6;
@@ -51,7 +54,7 @@ void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg
   *pcl_out = pl_surf;
 }
 
-void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out)
+bool Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr &pcl_out)
 {
   switch (time_unit)
   {
@@ -72,6 +75,7 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
     break;
   }
 
+  bool valid = true;
   switch (lidar_type)
   {
   case OUST64:
@@ -86,11 +90,151 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
     mid360_handler(msg);
     break;
 
+  case ROBOSENSE_E1R:
+    valid = robosense_e1r_handler(msg);
+    break;
+
   default:
     default_handler(msg);
     break;
   }
   *pcl_out = pl_surf;
+  return valid;
+}
+
+bool Preprocess::validate_e1r_schema(const sensor_msgs::msg::PointCloud2 &msg) const
+{
+  struct RequiredField
+  {
+    const char *name;
+    std::uint8_t datatype;
+    std::size_t size;
+  };
+  const RequiredField required_fields[] = {
+      {"x", sensor_msgs::msg::PointField::FLOAT32, sizeof(float)},
+      {"y", sensor_msgs::msg::PointField::FLOAT32, sizeof(float)},
+      {"z", sensor_msgs::msg::PointField::FLOAT32, sizeof(float)},
+      {"intensity", sensor_msgs::msg::PointField::FLOAT32, sizeof(float)},
+      {"ring", sensor_msgs::msg::PointField::UINT16, sizeof(std::uint16_t)},
+      {"timestamp", sensor_msgs::msg::PointField::FLOAT64, sizeof(double)},
+  };
+
+  if (msg.point_step == 0 || msg.row_step < msg.point_step * msg.width ||
+      msg.data.size() < static_cast<std::size_t>(msg.row_step) * msg.height)
+    return false;
+
+  for (const auto &required : required_fields)
+  {
+    const auto field = std::find_if(msg.fields.begin(), msg.fields.end(),
+                                    [&required](const sensor_msgs::msg::PointField &candidate) {
+                                      return candidate.name == required.name;
+                                    });
+    if (field == msg.fields.end() || field->datatype != required.datatype || field->count != 1 ||
+        static_cast<std::size_t>(field->offset) + required.size > msg.point_step)
+      return false;
+  }
+  return true;
+}
+
+bool Preprocess::robosense_e1r_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  if (!validate_e1r_schema(*msg))
+    return false;
+
+  pcl::PointCloud<robosense_ros::PointE1R> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  const std::size_t point_count = pl_orig.size();
+  if (point_count == 0)
+    return false;
+
+  const double effective_max_duration_ms =
+      max_scan_duration_ms > 0.0 ? max_scan_duration_ms : 2000.0 / std::max(1, SCAN_RATE);
+
+  if (feature_enabled)
+  {
+    for (int line = 0; line < N_SCANS; ++line)
+    {
+      pl_buff[line].clear();
+      pl_buff[line].reserve(point_count / std::max(1, N_SCANS) + 1);
+    }
+  }
+  else
+  {
+    pl_surf.reserve(point_count / std::max(1, point_filter_num) + 1);
+  }
+
+  std::size_t valid_index = 0;
+  for (const auto &point : pl_orig.points)
+  {
+    const double range_squared = point.x * point.x + point.y * point.y + point.z * point.z;
+    const double point_time_ms = point.timestamp * time_unit_scale;
+    if (!std::isfinite(range_squared) || range_squared <= blind * blind ||
+        point.ring >= N_SCANS || !std::isfinite(point_time_ms) || point_time_ms < 0.0 ||
+        point_time_ms > effective_max_duration_ms)
+      continue;
+
+    PointType converted;
+    converted.x = point.x;
+    converted.y = point.y;
+    converted.z = point.z;
+    converted.intensity = point.intensity;
+    converted.normal_x = 0.0f;
+    converted.normal_y = 0.0f;
+    converted.normal_z = 0.0f;
+    converted.curvature = static_cast<float>(point_time_ms);
+
+    if (feature_enabled)
+    {
+      pl_buff[point.ring].push_back(converted);
+    }
+    else if (valid_index++ % std::max(1, point_filter_num) == 0)
+    {
+      pl_surf.push_back(converted);
+    }
+  }
+
+  if (feature_enabled)
+  {
+    for (int line = 0; line < N_SCANS; ++line)
+    {
+      PointCloudXYZI &points = pl_buff[line];
+      if (points.size() < 2)
+        continue;
+
+      std::stable_sort(points.begin(), points.end(),
+                       [](const PointType &lhs, const PointType &rhs) {
+                         return lhs.curvature < rhs.curvature;
+                       });
+      vector<orgtype> &types = typess[line];
+      types.clear();
+      types.resize(points.size());
+      for (std::size_t i = 0; i + 1 < points.size(); ++i)
+      {
+        types[i].range = std::hypot(points[i].x, points[i].y);
+        const double dx = points[i].x - points[i + 1].x;
+        const double dy = points[i].y - points[i + 1].y;
+        const double dz = points[i].z - points[i + 1].z;
+        types[i].dista = dx * dx + dy * dy + dz * dz;
+      }
+      types.back().range = std::hypot(points.back().x, points.back().y);
+      give_feature(points, types);
+    }
+  }
+  else if (!std::is_sorted(pl_surf.begin(), pl_surf.end(),
+                           [](const PointType &lhs, const PointType &rhs) {
+                             return lhs.curvature < rhs.curvature;
+                           }))
+  {
+    std::stable_sort(pl_surf.begin(), pl_surf.end(),
+                     [](const PointType &lhs, const PointType &rhs) {
+                       return lhs.curvature < rhs.curvature;
+                     });
+  }
+  return !pl_surf.empty();
 }
 
 void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg)

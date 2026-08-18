@@ -123,6 +123,33 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_e1r_preprocess
+    test/test_e1r_preprocess.cpp
+    src/preprocess.cpp
+  )
+  target_include_directories(test_e1r_preprocess PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PCL_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_e1r_preprocess ${PCL_LIBRARIES} Eigen3::Eigen)
+  ament_target_dependencies(test_e1r_preprocess ${dependencies})
+
+  ament_add_gtest(test_time_utils test/test_time_utils.cpp)
+  target_include_directories(test_time_utils PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  ament_target_dependencies(test_time_utils rclcpp)
+
+  ament_add_gtest(test_gravity_alignment test/test_gravity_alignment.cpp)
+  target_include_directories(test_gravity_alignment PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_gravity_alignment Eigen3::Eigen)
+endif()
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}

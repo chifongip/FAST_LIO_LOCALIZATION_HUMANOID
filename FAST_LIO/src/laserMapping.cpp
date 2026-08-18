@@ -33,6 +33,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <cmath>
 #include <mutex>
 #include <math.h>
 #include <thread>
@@ -75,6 +76,8 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool publish_tf_en = true;
+string odom_frame_id = "camera_init", body_frame_id = "body";
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -142,6 +145,21 @@ geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
+
+rclcpp::Clock &diagnostic_clock()
+{
+    static rclcpp::Clock clock(RCL_STEADY_TIME);
+    return clock;
+}
+
+bool current_lidar_stamp(builtin_interfaces::msg::Time &stamp)
+{
+    if (try_get_ros_time(lidar_end_time, stamp))
+        return true;
+    RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                          "Refusing to publish invalid LiDAR timestamp: %.9f", lidar_end_time);
+    return false;
+}
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 void SigHandle(int sig)
@@ -292,6 +310,12 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
+    if (msg->header.stamp.sec < 0)
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping LiDAR message with a negative header timestamp");
+        return;
+    }
     mtx_buffer.lock();
     scan_count++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -307,7 +331,13 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     }
 
     PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
+    if (!p_pre->process(msg, ptr))
+    {
+        mtx_buffer.unlock();
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping LiDAR message with an invalid schema, timing, or no usable points");
+        return;
+    }
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
@@ -364,11 +394,29 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
-    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
+    if (msg_in->header.stamp.sec < 0)
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping IMU message with a negative header timestamp");
+        return;
+    }
+    const double source_timestamp = get_time_sec(msg_in->header.stamp);
+    double corrected_timestamp = source_timestamp - time_diff_lidar_to_imu;
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
     {
-        msg->header.stamp =
-            rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
+        corrected_timestamp = timediff_lidar_wrt_imu + source_timestamp;
+    }
+    if (!std::isfinite(corrected_timestamp) || corrected_timestamp < 0.0)
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping IMU message with invalid corrected timestamp: %.9f", corrected_timestamp);
+        return;
+    }
+    if (!try_get_ros_time(corrected_timestamp, msg->header.stamp))
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping IMU message with an out-of-range timestamp: %.9f", corrected_timestamp);
+        return;
     }
 
     double timestamp = get_time_sec(msg->header.stamp);
@@ -402,20 +450,53 @@ bool sync_packages(MeasureGroup &meas)
     {
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
+        if (!std::isfinite(meas.lidar_beg_time) || meas.lidar_beg_time < 0.0)
+        {
+            RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                                 "Dropping LiDAR scan with invalid header timestamp: %.9f", meas.lidar_beg_time);
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            return false;
+        }
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             std::cerr << "Too few input point cloud!\n";
         }
-        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
-        {
-            lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-        }
         else
         {
-            scan_num++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            const double scan_duration = meas.lidar->points.back().curvature / double(1000);
+            const double max_scan_duration = p_pre->max_scan_duration_ms > 0.0
+                                                 ? p_pre->max_scan_duration_ms / 1000.0
+                                                 : 2.0 / std::max(1, p_pre->SCAN_RATE);
+            if (!std::isfinite(scan_duration) || scan_duration < 0.0 ||
+                (p_pre->lidar_type == ROBOSENSE_E1R && scan_duration > max_scan_duration))
+            {
+                RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                                     "Dropping LiDAR scan with invalid point time offset: %.9f", scan_duration);
+                lidar_buffer.pop_front();
+                time_buffer.pop_front();
+                return false;
+            }
+            if (scan_duration < 0.5 * lidar_mean_scantime)
+            {
+                lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
+            }
+            else
+            {
+                scan_num++;
+                lidar_end_time = meas.lidar_beg_time + scan_duration;
+                lidar_mean_scantime += (scan_duration - lidar_mean_scantime) / scan_num;
+            }
+        }
+
+        if (!std::isfinite(lidar_end_time) || lidar_end_time < 0.0)
+        {
+            RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                                 "Dropping LiDAR scan with invalid end timestamp: %.9f", lidar_end_time);
+            lidar_buffer.pop_front();
+            time_buffer.pop_front();
+            return false;
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -518,9 +599,9 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
 
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        if (!current_lidar_stamp(laserCloudmsg.header.stamp))
+            return;
+        laserCloudmsg.header.frame_id = odom_frame_id;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -571,8 +652,9 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    if (!current_lidar_stamp(laserCloudmsg.header.stamp))
+        return;
+    laserCloudmsg.header.frame_id = body_frame_id;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -588,8 +670,9 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     }
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    if (!current_lidar_stamp(laserCloudFullRes3.header.stamp))
+        return;
+    laserCloudFullRes3.header.frame_id = odom_frame_id;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -609,9 +692,9 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    if (!current_lidar_stamp(laserCloudmsg.header.stamp))
+        return;
+    laserCloudmsg.header.frame_id = odom_frame_id;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -641,9 +724,10 @@ void set_posestamp(T &out)
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> &tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+    odomAftMapped.header.frame_id = odom_frame_id;
+    odomAftMapped.child_frame_id = body_frame_id;
+    if (!current_lidar_stamp(odomAftMapped.header.stamp))
+        return;
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
@@ -659,9 +743,9 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 
     geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
+    trans.header.frame_id = odom_frame_id;
     trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = "body";
+    trans.child_frame_id = body_frame_id;
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -669,14 +753,16 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
+    if (publish_tf_en)
+        tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    if (!current_lidar_stamp(msg_body_pose.header.stamp))
+        return;
+    msg_body_pose.header.frame_id = odom_frame_id;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -821,6 +907,9 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.tf_en", true);
+        this->declare_parameter<string>("publish.odom_frame", "camera_init");
+        this->declare_parameter<string>("publish.body_frame", "body");
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -842,6 +931,7 @@ public:
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
+        this->declare_parameter<double>("preprocess.max_scan_duration_ms", 0.0);
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
@@ -857,6 +947,9 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.tf_en", publish_tf_en, true);
+        this->get_parameter_or<string>("publish.odom_frame", odom_frame_id, "camera_init");
+        this->get_parameter_or<string>("publish.body_frame", body_frame_id, "body");
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -878,6 +971,7 @@ public:
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+        this->get_parameter_or<double>("preprocess.max_scan_duration_ms", p_pre->max_scan_duration_ms, 0.0);
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
@@ -887,10 +981,19 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
+        if (p_pre->N_SCANS < 1 || p_pre->N_SCANS > 128)
+            throw std::invalid_argument("preprocess.scan_line must be between 1 and 128");
+        if (p_pre->SCAN_RATE <= 0)
+            throw std::invalid_argument("preprocess.scan_rate must be positive");
+        if (p_pre->point_filter_num <= 0)
+            throw std::invalid_argument("point_filter_num must be positive");
+        if (p_pre->lidar_type == ROBOSENSE_E1R && p_pre->max_scan_duration_ms < 0.0)
+            throw std::invalid_argument("preprocess.max_scan_duration_ms cannot be negative");
+
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id = "camera_init";
+        path.header.frame_id = odom_frame_id;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;

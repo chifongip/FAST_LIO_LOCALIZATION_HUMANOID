@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, SetParameter
 from launch_ros.substitutions import FindPackageShare
@@ -15,6 +16,39 @@ def generate_launch_description():
         default_value='false',
         description='Use simulation time'
     )
+    map_file_arg = DeclareLaunchArgument(
+        'map_file',
+        default_value='/home/ubuntu/Humanoid-Nav/2025-10-02-Lab.pcd',
+        description='PCD map used for global localization'
+    )
+    imu_frame_arg = DeclareLaunchArgument(
+        'imu_frame', default_value='imu_link',
+        description='Frame represented by FAST-LIO odometry'
+    )
+    body_frame_arg = DeclareLaunchArgument(
+        'body_frame', default_value='base_link',
+        description='Robot body frame used for scan matching'
+    )
+    output_frame_arg = DeclareLaunchArgument(
+        'output_frame', default_value='motion_link',
+        description='Frame represented by /localization_3d'
+    )
+    publish_robot_root_tf_arg = DeclareLaunchArgument(
+        'publish_robot_root_tf', default_value='false',
+        description='Publish the local odometry frame to robot root transform'
+    )
+    publish_output_tf_arg = DeclareLaunchArgument(
+        'publish_output_tf', default_value='true',
+        description='Publish a direct map transform for the output frame'
+    )
+    tf_lookup_max_age_arg = DeclareLaunchArgument(
+        'tf_lookup_max_age_ms', default_value='100.0',
+        description='Maximum age for a fallback robot transform'
+    )
+    legacy_static_frames_arg = DeclareLaunchArgument(
+        'publish_legacy_static_frames', default_value='true',
+        description='Publish the G1 identity imu/base/motion transforms'
+    )
 
     # 配置文件路径
     config_file = PathJoinSubstitution([
@@ -23,8 +57,7 @@ def generate_launch_description():
         'loc_param_g1.yaml'
     ])
 
-    # 地图文件路径 - 使用绝对路径指向源码目录中的地图文件
-    map_file = '/home/sax/GO2_Localization_ROS2/src/GO2_Localization_ROS2/data/1.test.ply'
+    map_file = LaunchConfiguration('map_file')
 
     # 静态TF发布节点 - camera_init to odom
     static_tf_camera_init2odom = Node(
@@ -40,7 +73,8 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='imulink2baselink',
-        arguments=['0', '0', '0', '0', '0', '0', '1', 'imu_link', 'base_link']
+        arguments=['0', '0', '0', '0', '0', '0', '1', 'imu_link', 'base_link'],
+        condition=IfCondition(LaunchConfiguration('publish_legacy_static_frames'))
     )
 
     # 静态TF发布节点 - base_link to motion_link
@@ -50,7 +84,8 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='base_center_broadcaster',
         arguments=['0', '0', '0', '0', '0', '0',
-                   '1', 'base_link', 'motion_link']
+                   '1', 'base_link', 'motion_link'],
+        condition=IfCondition(LaunchConfiguration('publish_legacy_static_frames'))
     )
 
     # 全局定位节点
@@ -78,6 +113,12 @@ def generate_launch_description():
                 'kalman_estimatedMeasVar2': 0.02,
                 'confidence_loc_th': 0.7,
                 'dis_updatemap': 3.5,
+                'imu_frame': LaunchConfiguration('imu_frame'),
+                'body_frame': LaunchConfiguration('body_frame'),
+                'output_frame': LaunchConfiguration('output_frame'),
+                'publish_robot_root_tf': LaunchConfiguration('publish_robot_root_tf'),
+                'publish_output_tf': LaunchConfiguration('publish_output_tf'),
+                'tf_lookup_max_age_ms': LaunchConfiguration('tf_lookup_max_age_ms'),
                 'use_sim_time': LaunchConfiguration('use_sim_time')
             }
         ]
@@ -93,7 +134,7 @@ def generate_launch_description():
             'input_topic': '/cloud_registered_body_1',
             'output_topic': '/cloud_registered_map',
             'global_map_topic': '/global_map',
-            'source_frame': 'base_link',
+            'source_frame': LaunchConfiguration('body_frame'),
             'target_frame': 'map',
             'voxel_leaf_size': 0.1,
             'map_voxel_leaf_size': 0.2,
@@ -106,6 +147,14 @@ def generate_launch_description():
 
     return LaunchDescription([
         use_sim_time_arg,
+        map_file_arg,
+        imu_frame_arg,
+        body_frame_arg,
+        output_frame_arg,
+        publish_robot_root_tf_arg,
+        publish_output_tf_arg,
+        tf_lookup_max_age_arg,
+        legacy_static_frames_arg,
         static_tf_camera_init2odom,
         static_tf_imulink2baselink,
         static_tf_base_center,

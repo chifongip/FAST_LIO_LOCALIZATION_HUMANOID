@@ -30,6 +30,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(urdf REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(YAMLCPP REQUIRED yaml-cpp)
@@ -39,7 +40,7 @@ find_package(OpenCV REQUIRED)
 find_package(Boost REQUIRED COMPONENTS filesystem system)
 
 # Set Open3D path - modify this to your installation path
-set(Open3D_DIR "/home/sax/open3d141/lib/cmake/Open3D")
+set(Open3D_DIR "/home/ubuntu/Humanoid-Nav/src/open3d141/lib/cmake/Open3D")
 
 # set(Open3D_DIR "/home/unitree/open3d141_arm/open3d141/lib/cmake/Open3D")
 find_package(Open3D REQUIRED)
@@ -171,7 +172,14 @@ install(DIRECTORY include/
 
 if(BUILD_TESTING)
         find_package(ament_lint_auto REQUIRED)
+        find_package(ament_cmake_gtest REQUIRED)
         ament_lint_auto_find_test_dependencies()
+
+        ament_add_gtest(test_transform_utils test/test_transform_utils.cpp)
+        target_include_directories(test_transform_utils PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(test_transform_utils Eigen3::Eigen)
 endif()
 
 ament_package()
