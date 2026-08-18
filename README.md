@@ -129,7 +129,7 @@ catkin_make -DROS_EDITION=ROS1
 
 Remember to modify your computer ip address, follow [G1 SDK Development Guide/Lidar Route](https://support.unitree.com/home/zh/G1_developer/lidar_Instructions).
 
-If you need to adjust the extrinsics of the pointcloud and IMU, just modify the ``extrinsic_parameter`` in [livox_ros_driver2/config/MID360_config.json](livox_ros_driver2/config/MID360_config.json).
+If you need to adjust the extrinsics of the pointcloud and IMU, modify the ``extrinsic_parameter`` in [livox_ros_driver2/config/MID360_config.json](livox_ros_driver2/config/MID360_config.json). The driver applies this rotation to both the published point cloud and the IMU's angular-velocity and acceleration vectors, so they remain in the same frame.
 
 ```
 #For example, "roll" for reversed Livox MID360 on Unitree G1 is 180.0
