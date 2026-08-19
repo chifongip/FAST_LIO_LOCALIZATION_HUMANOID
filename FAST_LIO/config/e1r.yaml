@@ -14,6 +14,8 @@
       imu_topic: "/aima/hal/sensor/lidar_chest_front/imu"
       time_sync_en: false
       time_offset_lidar_to_imu: 0.0
+      # Added to both sensor header stamps; normally zero when ROS shares the sensor clock.
+      sensor_time_offset_to_ros_sec: 0.0
 
     preprocess:
       lidar_type: 5

@@ -31,4 +31,13 @@ inline bool try_get_ros_time(double timestamp, builtin_interfaces::msg::Time &ti
     return true;
 }
 
+inline bool try_apply_time_offset(double timestamp, double offset, double &adjusted_timestamp)
+{
+    if (!std::isfinite(timestamp) || !std::isfinite(offset))
+        return false;
+
+    adjusted_timestamp = timestamp + offset;
+    return std::isfinite(adjusted_timestamp) && adjusted_timestamp >= 0.0;
+}
+
 #endif

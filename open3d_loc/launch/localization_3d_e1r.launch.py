@@ -24,6 +24,13 @@ def generate_launch_description():
         'start_rviz', default_value='true',
         description='Start RViz'
     )
+    sensor_time_offset_arg = DeclareLaunchArgument(
+        'sensor_time_offset_to_ros_sec', default_value='0.0',
+        description=(
+            'Seconds added to E1R LiDAR and IMU header stamps to express them '
+            'in the local ROS clock'
+        )
+    )
 
     fast_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
@@ -33,6 +40,8 @@ def generate_launch_description():
             'config_file': 'e1r.yaml',
             'use_sim_time': LaunchConfiguration('use_sim_time'),
             'rviz': 'false',
+            'sensor_time_offset_to_ros_sec': LaunchConfiguration(
+                'sensor_time_offset_to_ros_sec'),
         }.items()
     )
 
@@ -68,6 +77,7 @@ def generate_launch_description():
         map_file_arg,
         use_sim_time_arg,
         start_rviz_arg,
+        sensor_time_offset_arg,
         fast_lio_launch,
         localization_launch,
         rviz_node,

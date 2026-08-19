@@ -85,6 +85,7 @@ float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
+double sensor_time_offset_to_ros_sec = 0.0;
 
 mutex mtx_buffer;
 condition_variable sig_buffer;
@@ -317,9 +318,17 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
                              "Dropping LiDAR message with a negative header timestamp");
         return;
     }
+    const double source_timestamp = get_time_sec(msg->header.stamp);
+    double cur_time = 0.0;
+    if (!try_apply_time_offset(source_timestamp, sensor_time_offset_to_ros_sec, cur_time))
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping LiDAR message with invalid corrected timestamp: %.9f",
+                             source_timestamp + sensor_time_offset_to_ros_sec);
+        return;
+    }
     mtx_buffer.lock();
     scan_count++;
-    double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -352,8 +361,16 @@ bool timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 // void livox_pcl_cbk(const livox_interfaces::msg::CustomMsg::UniquePtr msg)
 {
+    const double source_timestamp = get_time_sec(msg->header.stamp);
+    double cur_time = 0.0;
+    if (!try_apply_time_offset(source_timestamp, sensor_time_offset_to_ros_sec, cur_time))
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping LiDAR message with invalid corrected timestamp: %.9f",
+                             source_timestamp + sensor_time_offset_to_ros_sec);
+        return;
+    }
     mtx_buffer.lock();
-    double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -407,13 +424,15 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     {
         corrected_timestamp = timediff_lidar_wrt_imu + source_timestamp;
     }
-    if (!std::isfinite(corrected_timestamp) || corrected_timestamp < 0.0)
+    double ros_timestamp = 0.0;
+    if (!try_apply_time_offset(
+            corrected_timestamp, sensor_time_offset_to_ros_sec, ros_timestamp))
     {
         RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
                              "Dropping IMU message with invalid corrected timestamp: %.9f", corrected_timestamp);
         return;
     }
-    if (!try_get_ros_time(corrected_timestamp, msg->header.stamp))
+    if (!try_get_ros_time(ros_timestamp, msg->header.stamp))
     {
         RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
                              "Dropping IMU message with an out-of-range timestamp: %.9f", corrected_timestamp);
@@ -967,6 +986,7 @@ public:
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        this->declare_parameter<double>("common.sensor_time_offset_to_ros_sec", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -1007,6 +1027,14 @@ public:
         this->get_parameter_or<string>("common.imu_topic", imu_topic, "/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<double>(
+            "common.sensor_time_offset_to_ros_sec", sensor_time_offset_to_ros_sec, 0.0);
+        if (!std::isfinite(sensor_time_offset_to_ros_sec))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Ignoring non-finite common.sensor_time_offset_to_ros_sec");
+            sensor_time_offset_to_ros_sec = 0.0;
+        }
         this->get_parameter_or<double>("filter_size_corner", filter_size_corner_min, 0.5);
         this->get_parameter_or<double>("filter_size_surf", filter_size_surf_min, 0.5);
         this->get_parameter_or<double>("filter_size_map", filter_size_map_min, 0.5);

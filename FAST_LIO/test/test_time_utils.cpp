@@ -29,3 +29,14 @@ TEST(TimeUtils, RejectsInvalidOrOutOfRangeTimestamps)
   EXPECT_FALSE(try_get_ros_time(std::numeric_limits<double>::infinity(), time));
   EXPECT_FALSE(try_get_ros_time(static_cast<double>(std::numeric_limits<int32_t>::max()) + 1.0, time));
 }
+
+TEST(TimeUtils, AppliesFiniteNonnegativeOffsets)
+{
+  double adjusted_timestamp = 0.0;
+
+  ASSERT_TRUE(try_apply_time_offset(1787123492.0, -0.35, adjusted_timestamp));
+  EXPECT_NEAR(adjusted_timestamp, 1787123491.65, 1e-6);
+
+  EXPECT_FALSE(try_apply_time_offset(0.1, -0.2, adjusted_timestamp));
+  EXPECT_FALSE(try_apply_time_offset(1.0, std::numeric_limits<double>::quiet_NaN(), adjusted_timestamp));
+}

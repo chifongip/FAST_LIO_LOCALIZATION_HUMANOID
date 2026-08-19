@@ -21,6 +21,8 @@ def generate_launch_description():
     config_file = LaunchConfiguration('config_file')
     rviz_use = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
+    sensor_time_offset_to_ros_sec = LaunchConfiguration(
+        'sensor_time_offset_to_ros_sec')
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
@@ -43,12 +45,23 @@ def generate_launch_description():
         'rviz_cfg', default_value=default_rviz_config_path,
         description='RViz config file path'
     )
+    declare_sensor_time_offset_cmd = DeclareLaunchArgument(
+        'sensor_time_offset_to_ros_sec', default_value='0.0',
+        description=(
+            'Seconds added to LiDAR and IMU header stamps to express them in '
+            'the local ROS clock'
+        )
+    )
 
     fast_lio_node = Node(
         package='fast_lio',
         executable='fastlio_mapping',
         parameters=[PathJoinSubstitution([config_path, config_file]),
-                    {'use_sim_time': use_sim_time}],
+                    {
+                        'use_sim_time': use_sim_time,
+                        'common.sensor_time_offset_to_ros_sec':
+                            sensor_time_offset_to_ros_sec,
+                    }],
         output='screen'
     )
     rviz_node = Node(
@@ -64,6 +77,7 @@ def generate_launch_description():
     ld.add_action(decalre_config_file_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
+    ld.add_action(declare_sensor_time_offset_cmd)
 
     ld.add_action(fast_lio_node)
     # ld.add_action(rviz_node)
