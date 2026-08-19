@@ -47,6 +47,7 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  bool last_gyro_measurement(V3D &measurement) const;
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -73,6 +74,7 @@ class ImuProcess
   V3D Lidar_T_wrt_IMU;
   V3D mean_acc;
   V3D mean_gyr;
+  V3D gyro_measurement_last;
   V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
@@ -80,6 +82,7 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  bool   has_last_gyro_measurement_ = false;
 };
 
 ImuProcess::ImuProcess()
@@ -93,6 +96,7 @@ ImuProcess::ImuProcess()
   cov_bias_acc  = V3D(0.0001, 0.0001, 0.0001);
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
+  gyro_measurement_last = Zero3d;
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
@@ -106,7 +110,9 @@ void ImuProcess::Reset()
   // ROS_WARN("Reset ImuProcess");
   mean_acc      = V3D(0, 0, -1.0);
   mean_gyr      = V3D(0, 0, 0);
+  gyro_measurement_last = Zero3d;
   angvel_last       = Zero3d;
+  has_last_gyro_measurement_ = false;
   imu_need_init_    = true;
   start_timestamp_  = -1;
   init_iter_num     = 1;
@@ -152,6 +158,14 @@ void ImuProcess::set_gyr_bias_cov(const V3D &b_g)
 void ImuProcess::set_acc_bias_cov(const V3D &b_a)
 {
   cov_bias_acc = b_a;
+}
+
+bool ImuProcess::last_gyro_measurement(V3D &measurement) const
+{
+  if (!has_last_gyro_measurement_)
+    return false;
+  measurement = gyro_measurement_last;
+  return true;
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
@@ -249,6 +263,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double dt = 0;
 
   input_ikfom in;
+  gyro_measurement_last = meas.gyro_at_lidar_end;
+  has_last_gyro_measurement_ = meas.gyro_at_lidar_end_valid;
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
     auto &&head = *(it_imu);

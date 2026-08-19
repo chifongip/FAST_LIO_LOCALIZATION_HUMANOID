@@ -148,6 +148,12 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(test_gravity_alignment Eigen3::Eigen)
+
+  ament_add_gtest(test_odometry_utils test/test_odometry_utils.cpp)
+  target_include_directories(test_odometry_utils PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_odometry_utils Eigen3::Eigen)
 endif()
 
 # ---------------- Install --------------- #

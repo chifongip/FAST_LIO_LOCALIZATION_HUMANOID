@@ -248,6 +248,17 @@ The correct graph is as follows, this is the case with rosbag. If you use livox_
 | /localization_3d_confidence | std_msgs/Float32          | pointcloud registration fitness, higher the value, the more accurate the localization |
 | /localization_3d_delay_ms   | std_msgs/Float32          | delay time between localization result and odometry(from fast_lio), in milliseconds   |
 
+### Local odometry velocity
+
+`/Odometry_loc` is the continuous local-motion estimate. Its pose and twist
+are expressed in its configured child frame (the IMU frame for the E1R
+configuration). The linear velocity is rotated from the gravity-aligned local
+frame, and the angular velocity is the LiDAR-end, bias-corrected IMU gyro.
+
+Global Open3D outputs are pose corrections. ICP can update `map -> odom`
+discontinuously, so the map-frame `Odometry` topics must not be differentiated
+or used as a velocity source.
+
 Check rostopic by following command.
 
 ```

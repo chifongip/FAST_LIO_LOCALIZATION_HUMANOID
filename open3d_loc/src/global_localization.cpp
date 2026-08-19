@@ -577,6 +577,8 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         timestamp_odom_ = baselink2odom->header.stamp;
     }
 
+    // ICP updates map -> odom asynchronously, so differentiating this map-frame
+    // pose would create correction spikes rather than a physical body twist.
     Eigen::Isometry3d Isometry3d_baselink2map;
     Isometry3d_baselink2map.matrix() = mat_body_to_map;
     nav_msgs::msg::Odometry baselink2map;

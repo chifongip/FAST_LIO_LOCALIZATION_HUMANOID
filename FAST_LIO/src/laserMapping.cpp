@@ -62,6 +62,7 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 // #include <livox_interfaces/msg/custom_msg.hpp>
+#include "odometry_utils.hpp"
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -510,15 +511,40 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
     meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
+    meas.gyro_at_lidar_end_valid = false;
+    while (!imu_buffer.empty())
     {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
+        const double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
         if (imu_time > lidar_end_time)
             break;
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
+    }
+
+    if (!meas.imu.empty())
+    {
+        const auto &earlier_imu = meas.imu.back();
+        const double earlier_time = get_time_sec(earlier_imu->header.stamp);
+        const auto &earlier_gyro = earlier_imu->angular_velocity;
+        const V3D earlier_measurement(
+            earlier_gyro.x, earlier_gyro.y, earlier_gyro.z);
+
+        if (std::abs(earlier_time - lidar_end_time) <= 1e-9)
+        {
+            meas.gyro_at_lidar_end = earlier_measurement;
+            meas.gyro_at_lidar_end_valid = earlier_measurement.allFinite();
+        }
+        else if (!imu_buffer.empty())
+        {
+            const auto &later_imu = imu_buffer.front();
+            const auto &later_gyro = later_imu->angular_velocity;
+            const V3D later_measurement(later_gyro.x, later_gyro.y, later_gyro.z);
+            meas.gyro_at_lidar_end_valid = fast_lio::interpolateAngularVelocity(
+                earlier_time, earlier_measurement,
+                get_time_sec(later_imu->header.stamp), later_measurement,
+                lidar_end_time, meas.gyro_at_lidar_end);
+        }
     }
 
     lidar_buffer.pop_front();
@@ -728,19 +754,44 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = body_frame_id;
     if (!current_lidar_stamp(odomAftMapped.header.stamp))
         return;
-    set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
-    auto P = kf.get_P();
-    for (int i = 0; i < 6; i++)
+
+    V3D gyro_measurement_body;
+    if (!p_imu->last_gyro_measurement(gyro_measurement_body))
     {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Refusing to publish odometry without a time-aligned IMU angular velocity");
+        return;
     }
+
+    const M3D world_from_body = state_point.rot.toRotationMatrix();
+    const Eigen::Vector3d linear_velocity_world = state_point.vel;
+    const Eigen::Vector3d gyro_bias_body = state_point.bg;
+    const fast_lio::BodyTwist body_twist = fast_lio::bodyTwistFromState(
+        world_from_body, linear_velocity_world, gyro_measurement_body, gyro_bias_body);
+    const auto state_covariance = kf.get_P();
+    const fast_lio::PoseCovariance pose_covariance =
+        fast_lio::poseCovarianceFromState(state_covariance);
+    const fast_lio::TwistCovariance twist_covariance =
+        fast_lio::bodyTwistCovarianceFromState(
+            state_covariance, world_from_body, gyr_cov * Eigen::Matrix3d::Identity());
+
+    set_posestamp(odomAftMapped.pose);
+    odomAftMapped.twist.twist.linear.x = body_twist.linear.x();
+    odomAftMapped.twist.twist.linear.y = body_twist.linear.y();
+    odomAftMapped.twist.twist.linear.z = body_twist.linear.z();
+    odomAftMapped.twist.twist.angular.x = body_twist.angular.x();
+    odomAftMapped.twist.twist.angular.y = body_twist.angular.y();
+    odomAftMapped.twist.twist.angular.z = body_twist.angular.z();
+    for (int row = 0; row < 6; ++row)
+    {
+        for (int column = 0; column < 6; ++column)
+        {
+            const std::size_t index = static_cast<std::size_t>(row * 6 + column);
+            odomAftMapped.pose.covariance[index] = pose_covariance(row, column);
+            odomAftMapped.twist.covariance[index] = twist_covariance(row, column);
+        }
+    }
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = odom_frame_id;
