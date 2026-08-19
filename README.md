@@ -17,30 +17,19 @@
 Left is original, pointcloud is upside down and gravity acceleration measured by the IMU is negative, right is our modified.
 
 <div align="center">
-<img src="doc/ori.gif" width=49% />
-<img src="doc/modifed.gif" width=49% />
-</div>
-<div align="center">
-<img src="doc/ori.png" width=30% />
-<img src="doc/modifed.png" width=30% />
+<img src="doc/ori.png" width=49% />
+<img src="doc/modifed.png" width=49% />
 </div>
 
 **Livox MID360** coordinate system on the **Unitree GO2** and the robot dog's physical coordinate system differ only by **6°** on the Y-axis. We can directly choose to use the official driver.
-
-<div align="center">
-<img src="doc/GO2-MID360.gif" width=70% />
-</div>
 
 ### 0.2 Robust localization based on offline pointcloud map
 
 Our solution can handle **rough initial pose**, allows **robust localization**, and offline pointcloud map guarantee **no accumulated localization errors** caused by long hours of work(unlike common SLAM).In addition, we also tested it with a **robot dog**, and the visualization effect of the **colored point cloud** was better.
 
 <div align="center">
-<img src="doc/loc.gif" width=30% />
-<img src="doc/GO2-1.gif" width=53% />
 <img src="doc/g1.png" width=35% />
 <img src="doc/GO2-1.jpg" width=50% />
-
 </div>
 
 ### Contributors
@@ -234,7 +223,7 @@ Roslaunch the above node, in the newly opened terminal check by following comman
 rqt_graph
 ```
 
-The correct graph is as follows, this is the case with rosbag. If you use livox_ros_driver2 directly, ``/livox_lidar_publisher2`` will replace ``/play_xxx`` in the graph.
+When using a rosbag, confirm the expected graph connections. If you use livox_ros_driver2 directly, ``/livox_lidar_publisher2`` replaces ``/play_xxx`` in the graph.
 
 <div align="center">
 <img src="doc/rqt_graph.jpg" width=85% />
@@ -266,11 +255,7 @@ Check rostopic by following command.
 rostopic echo /localization_3d
 ```
 
-The delay time is tested in a **150m * 50m * 30m** large-scale pointcloud map, and the delay time is basically less than 30ms. The computer used in the test has 15GB of memory, CPU is 11th Gen Intel® Core™ i5-11400H @ 2.70GHz × 12, and the system is 64-bit Ubuntu18.04
-
-<div align="center">
-<img src="doc/delay_time.gif" width=75% />
-</div>
+The delay time is tested in a **150m * 50m * 30m** large-scale pointcloud map, and the delay time is basically less than 30ms. The computer used in the test has 15GB of memory, CPU is 11th Gen Intel® Core™ i5-11400H @ 2.70GHz × 12, and the system is 64-bit Ubuntu18.04.
 
 ## 6. Demo
 
@@ -279,23 +264,15 @@ The delay time is tested in a **150m * 50m * 30m** large-scale pointcloud map, a
 - Also can be downloaded from [Baidu Netdisk](https://pan.baidu.com/s/1vTLXVYJ6JBlbhNpDf87Cdg?pwd=spdg) (pwd: `spdg`). `mapping.bag` is data for mapping, and `loc.bag` is data for positioning.
 
 - We also provide a case study of a color point cloud map using a robot dog as the demo.You can download it via this [link](https://pan.baidu.com/s/1lN0ZjEEJDp8-3oz8JRtt7w?pwd=6bqu ). (pwd: `6bqu`)
-- If you have an iPhone model with lidar, we strongly recommend using the ``3D Scanner`` app from the App Store to build and locate color point cloud maps.Refer to [doc/3DScanner.mp4](doc/3DScanner.mp4).
+- If you have an iPhone model with lidar, we strongly recommend using the ``3D Scanner`` app from the App Store to build and locate color point cloud maps.
 
 ### 6.1 Mapping
 
 Use **fast_lio** to do mapping.
 
-Refer to [doc/demo_mapping_fastlio.mp4](doc/demo_mapping_fastlio.mp4).
-
 ### 6.2 Fine tune(Recommend)
 
 Use **CloudCompare** to fine tune. Downsampling to reduce the size of the pointcloud map, align the ground plane, and try to ensure that the z-axis of the ground is 0.
-
-Refer to [doc/demo_finetune.mp4](doc/demo_finetune.mp4).
-
-### 6.2 Localizaiton
-
-Refer to [doc/demo_loc.mp4](doc/demo_loc.mp4).
 
 ## 7. Acknowledgments
 

@@ -1,0 +1,3 @@
+# Keep bulky documentation media in release assets or external hosting.
+/doc/*.gif
+/doc/*.mp4
