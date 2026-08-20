@@ -208,7 +208,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   M3D world_from_imu = M3D::Identity();
   if (fast_lio::gravityAlignedWorldFromImu(mean_acc, world_from_imu))
   {
-    // camera_init is gravity aligned: +Z is up and gravity is -Z.
+    // odom is gravity aligned: +Z is up and gravity is -Z.
     init_state.rot = SO3(world_from_imu);
     init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
   }

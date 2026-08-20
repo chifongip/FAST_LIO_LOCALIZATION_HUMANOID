@@ -59,14 +59,6 @@ def generate_launch_description():
 
     map_file = LaunchConfiguration('map_file')
 
-    # 静态TF发布节点 - camera_init to odom
-    static_tf_camera_init2odom = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='camera_init2odom',
-        arguments=['0', '0', '0', '0', '0', '0', '1', 'odom', 'camera_init']
-    )
-
     # 静态TF发布节点 - imu_link to base_link
     # 修正：父frame是imu_link，子frame是base_link
     static_tf_imulink2baselink = Node(
@@ -155,7 +147,6 @@ def generate_launch_description():
         publish_output_tf_arg,
         tf_lookup_max_age_arg,
         legacy_static_frames_arg,
-        static_tf_camera_init2odom,
         static_tf_imulink2baselink,
         static_tf_base_center,
         global_localization_node,

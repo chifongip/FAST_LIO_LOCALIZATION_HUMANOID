@@ -36,8 +36,6 @@ Visualization Manager:
         All Enabled: true
         base_link:
           Value: true
-        camera_init:
-          Value: true
         head_pitch_link:
           Value: true
         head_yaw_link:
@@ -136,64 +134,8 @@ Visualization Manager:
       Tree:
         map:
           odom:
-            camera_init:
-              base_link:
-                pelvis:
-                  imu_in_pelvis_link:
-                    {}
-                  left_hip_pitch_link:
-                    left_hip_roll_link:
-                      left_hip_yaw_link:
-                        left_knee_link:
-                          left_ankle_pitch_link:
-                            left_ankle_roll_link:
-                              {}
-                  right_hip_pitch_link:
-                    right_hip_roll_link:
-                      right_hip_yaw_link:
-                        right_knee_link:
-                          right_ankle_pitch_link:
-                            right_ankle_roll_link:
-                              {}
-                  waist_yaw_link:
-                    waist_pitch_link:
-                      torso_link:
-                        head_yaw_link:
-                          head_pitch_link:
-                            imu_in_head_link:
-                              {}
-                            rgb_head_center:
-                              {}
-                            rgb_head_rear:
-                              {}
-                            rgbd_head_front:
-                              {}
-                            stereo_head_front:
-                              stereo_head_front_right:
-                                {}
-                              stereo_imu_head_front:
-                                {}
-                        imu_in_torso_link:
-                          {}
-                        left_shoulder_pitch_link:
-                          left_shoulder_roll_link:
-                            left_shoulder_yaw_link:
-                              left_elbow_link:
-                                left_wrist_yaw_link:
-                                  left_wrist_pitch_link:
-                                    left_wrist_roll_link:
-                                      {}
-                        lidar_chest_front:
-                          lidar_imu_chest_front:
-                            {}
-                        right_shoulder_pitch_link:
-                          right_shoulder_roll_link:
-                            right_shoulder_yaw_link:
-                              right_elbow_link:
-                                right_wrist_yaw_link:
-                                  right_wrist_pitch_link:
-                                    right_wrist_roll_link:
-                                      {}
+            base_link:
+              {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Axes

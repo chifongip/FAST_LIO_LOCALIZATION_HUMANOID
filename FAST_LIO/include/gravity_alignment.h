@@ -6,7 +6,7 @@
 namespace fast_lio
 {
 // Builds R_world_imu so the stationary accelerometer direction becomes +Z in
-// camera_init. Yaw remains intentionally unconstrained by gravity.
+// odom. Yaw remains intentionally unconstrained by gravity.
 inline bool gravityAlignedWorldFromImu(
     const Eigen::Vector3d &specific_force, Eigen::Matrix3d &world_from_imu)
 {

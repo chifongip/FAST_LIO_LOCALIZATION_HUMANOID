@@ -41,7 +41,7 @@
 
     publish:
       tf_en: false
-      odom_frame: "camera_init"
+      odom_frame: "odom"
       body_frame: "lidar_imu_chest_front"
       path_en: true
       effect_map_en: false

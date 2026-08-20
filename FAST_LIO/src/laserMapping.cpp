@@ -78,7 +78,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 bool publish_tf_en = true;
-string odom_frame_id = "camera_init", body_frame_id = "body";
+string odom_frame_id = "odom", body_frame_id = "body";
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -745,7 +745,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
     // pcl::toROSMsg(*featsFromMap, laserCloudMap);
     // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
+    // laserCloudMap.header.frame_id = "odom";
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
@@ -978,7 +978,7 @@ public:
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<bool>("publish.tf_en", true);
-        this->declare_parameter<string>("publish.odom_frame", "camera_init");
+        this->declare_parameter<string>("publish.odom_frame", "odom");
         this->declare_parameter<string>("publish.body_frame", "body");
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
@@ -1019,7 +1019,7 @@ public:
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<bool>("publish.tf_en", publish_tf_en, true);
-        this->get_parameter_or<string>("publish.odom_frame", odom_frame_id, "camera_init");
+        this->get_parameter_or<string>("publish.odom_frame", odom_frame_id, "odom");
         this->get_parameter_or<string>("publish.body_frame", body_frame_id, "body");
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");

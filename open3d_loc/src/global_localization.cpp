@@ -742,7 +742,7 @@ void GloabalLocalization::LocalizationInitialize()
     std::shared_ptr<open3d::geometry::OrientedBoundingBox> OBB_map(new open3d::geometry::OrientedBoundingBox);
     std::shared_ptr<open3d::geometry::OrientedBoundingBox> OBB_scan(new open3d::geometry::OrientedBoundingBox);
 
-    /// 当前baselink到odom(camera_init)和map坐标系的关系
+    /// 当前baselink到odom和map坐标系的关系
     Eigen::Matrix4d mat_baselink2odom_cur = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d mat_baselink2map_cur = Eigen::Matrix4d::Identity();
 
