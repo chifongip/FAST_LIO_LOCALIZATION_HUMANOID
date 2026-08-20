@@ -55,6 +55,8 @@ def generate_launch_description():
             'imu_frame': 'lidar_imu_chest_front',
             'body_frame': 'base_link',
             'output_frame': 'torso_link',
+            # Publish the base pose derived from /Odometry_loc for Navigation2.
+            # fast_lio_odom_adapter publishes only the converted /odom topic.
             'publish_robot_root_tf': 'true',
             'publish_output_tf': 'false',
             'tf_lookup_max_age_ms': '100.0',
