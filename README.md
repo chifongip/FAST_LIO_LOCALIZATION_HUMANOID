@@ -66,6 +66,12 @@ Install Eigen by following command.
 sudo apt-get install libeigen3-dev
 ```
 
+**On ARM64 devices**, `liblapacke-dev` is also required. Install it by running:
+
+```
+sudo apt install liblapacke-dev
+```
+
 ### 1.3. Open3D
 
 Recommend use the precompiled Open3D library we provided. It can be downloaded from [Baidu Netdisk](link: https://pan.baidu.com/s/1vTLXVYJ6JBlbhNpDf87Cdg?pwd=spdg pwd: spdg), ``open3d141.zip``(tested) can be used for x86 architecture and ``open3d141_arm.zip``(not fully tested) can be used for arm architecture.
