@@ -15,8 +15,12 @@
 
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <queue>
+#include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <optional>
 #include <stdexcept>
+#include <string>
 // #include <pcl/common/transforms.h>
 
 #include <Eigen/Core>
@@ -28,6 +32,28 @@
 #include "open3d_loc/transform_utils.hpp"
 
 #define PI 3.1415926
+
+std::optional<open3d::utility::VerbosityLevel> ParseOpen3dVerbosity(
+    std::string verbosity)
+{
+    std::transform(
+        verbosity.begin(), verbosity.end(), verbosity.begin(),
+        [](unsigned char character) {return static_cast<char>(std::tolower(character));});
+
+    if (verbosity == "debug") {
+        return open3d::utility::VerbosityLevel::Debug;
+    }
+    if (verbosity == "info") {
+        return open3d::utility::VerbosityLevel::Info;
+    }
+    if (verbosity == "warning" || verbosity == "warn") {
+        return open3d::utility::VerbosityLevel::Warning;
+    }
+    if (verbosity == "error") {
+        return open3d::utility::VerbosityLevel::Error;
+    }
+    return std::nullopt;
+}
 
 class KalmanFilter
 {
@@ -256,6 +282,19 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
                                              tf_buffer_(this->get_clock()),
                                              tf_listener_(std::make_shared<tf2_ros::TransformListener>(tf_buffer_))
 {
+    const std::string open3d_verbosity =
+        this->declare_parameter<std::string>("open3d_verbosity", "warning");
+    const auto verbosity_level = ParseOpen3dVerbosity(open3d_verbosity);
+    if (verbosity_level) {
+        open3d::utility::SetVerbosityLevel(*verbosity_level);
+    } else {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Unsupported open3d_verbosity '%s'; using 'warning'",
+            open3d_verbosity.c_str());
+        open3d::utility::SetVerbosityLevel(open3d::utility::VerbosityLevel::Warning);
+    }
+
     flag_exit_ = false;
     loc_initialized_ = false;
     mat_baselink2odom_ = Eigen::Matrix4d::Identity();

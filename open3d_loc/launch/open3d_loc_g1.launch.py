@@ -49,6 +49,10 @@ def generate_launch_description():
         'publish_legacy_static_frames', default_value='true',
         description='Publish the G1 identity imu/base/motion transforms'
     )
+    open3d_verbosity_arg = DeclareLaunchArgument(
+        'open3d_verbosity', default_value='warning',
+        description='Open3D log level: debug, info, warning, or error'
+    )
 
     # 配置文件路径
     config_file = PathJoinSubstitution([
@@ -86,6 +90,7 @@ def generate_launch_description():
         executable='global_localization_node',
         name='global_localization_node',
         output='screen',
+        arguments=['--ros-args', '--log-level', 'global_localization_node:=error'],
         parameters=[
             config_file,
             {
@@ -111,6 +116,7 @@ def generate_launch_description():
                 'publish_robot_root_tf': LaunchConfiguration('publish_robot_root_tf'),
                 'publish_output_tf': LaunchConfiguration('publish_output_tf'),
                 'tf_lookup_max_age_ms': LaunchConfiguration('tf_lookup_max_age_ms'),
+                'open3d_verbosity': LaunchConfiguration('open3d_verbosity'),
                 'use_sim_time': LaunchConfiguration('use_sim_time')
             }
         ]
@@ -147,6 +153,7 @@ def generate_launch_description():
         publish_output_tf_arg,
         tf_lookup_max_age_arg,
         legacy_static_frames_arg,
+        open3d_verbosity_arg,
         static_tf_imulink2baselink,
         static_tf_base_center,
         global_localization_node,
