@@ -7,3 +7,32 @@ global_localization_node:
       x: [0.001, 0.002]
       y: [0.001, 0.005]
       z: [0.00001, 0.04]
+
+    # Error-state filter for the map -> odom correction.
+    # Axis order is [x, y, z, roll, pitch, yaw].
+    fusion:
+      enabled: true
+      update_mask: [true, true, true, true, true, true]
+      initial_stddev: [0.25, 0.25, 0.15, 0.05, 0.05, 0.15]
+      process_stddev_time: [0.02, 0.02, 0.01, 0.005, 0.005, 0.01]
+      process_stddev_distance: [0.01, 0.01, 0.005, 0.002, 0.002, 0.005]
+      process_stddev_rotation: [0.01, 0.01, 0.005, 0.005, 0.005, 0.01]
+      measurement_stddev_floor: [0.03, 0.03, 0.03, 0.01, 0.01, 0.02]
+      shared_lidar_covariance_scale: 4.0
+      max_measurement_age: 1.0
+      max_icp_rmse: 0.3
+      min_correspondences: 100
+      max_consecutive_rejections: 5
+      max_innovation_translation: 1.0
+      max_innovation_rotation: 0.35
+      mahalanobis_threshold: 13.277
+      recovery:
+        enabled: true
+        required_consistent_measurements: 2
+        minimum_candidate_interval: 0.75
+        candidate_timeout: 3.0
+        consistency_mahalanobis_threshold: 13.277
+        max_candidate_translation_delta: 0.50
+        max_candidate_rotation_delta: 0.20
+        max_step_translation: 0.50
+        max_step_rotation: 0.15

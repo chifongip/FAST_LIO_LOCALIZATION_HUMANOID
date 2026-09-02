@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
 project(open3d_loc)
 
-# Default to C++14
+# Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
-        set(CMAKE_CXX_STANDARD 14)
+        set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -20,6 +20,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -122,11 +123,15 @@ ament_target_dependencies(open3d_conversions
 )
 
 # Build global_localization_node
+add_library(global_correction_filter src/global_correction_filter.cpp)
+target_link_libraries(global_correction_filter Eigen3::Eigen)
+
 add_executable(global_localization_node src/global_localization.cpp)
 target_link_libraries(global_localization_node
         ${Open3D_LIBRARIES}
         open3d_registration
         open3d_conversions
+        global_correction_filter
 )
 ament_target_dependencies(global_localization_node
         rclcpp
@@ -134,6 +139,7 @@ ament_target_dependencies(global_localization_node
         geometry_msgs
         nav_msgs
         sensor_msgs
+        diagnostic_msgs
         tf2
         tf2_ros
         tf2_geometry_msgs
@@ -146,6 +152,7 @@ ament_target_dependencies(global_localization_node
 install(TARGETS
         open3d_registration
         open3d_conversions
+        global_correction_filter
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin
@@ -181,6 +188,12 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
         target_link_libraries(test_transform_utils Eigen3::Eigen)
+
+        ament_add_gtest(test_global_correction_filter test/test_global_correction_filter.cpp)
+        target_include_directories(test_global_correction_filter PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(test_global_correction_filter global_correction_filter Eigen3::Eigen)
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
 endif()

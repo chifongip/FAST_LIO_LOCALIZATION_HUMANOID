@@ -254,6 +254,32 @@ Global Open3D outputs are pose corrections. ICP can update `map -> odom`
 discontinuously, so the map-frame `Odometry` topics must not be differentiated
 or used as a velocity source.
 
+By default, `open3d_loc` now filters the global correction rather than replacing
+it with every accepted ICP result. FAST-LIO remains the continuous
+`odom -> base_link` source, while ICP measures `map -> odom`. The filter uses
+ICP information and RMSE to weight corrections and rejects stale, weak, or
+implausible matches. Configure the corrected axes with `fusion.update_mask` in
+the order `[x, y, z, roll, pitch, yaw]`; the current G1 configuration enables
+all six axes. For a gravity-aligned map with reliable IMU attitude, correcting
+only XYZ and yaw is often safer. Set `fusion.enabled: false` to compare against
+the legacy scalar smoothing path. See [the Open3D localization parameter guide](open3d_loc/README.md)
+for every parameter, diagnostics, and a safe tuning workflow.
+
+The authoritative filtered correction is published on `/odom2map` and TF.
+`/odom2map_icp` exposes the raw ICP candidate, `/localization_3d_odom` includes
+the fused pose covariance, and `/localization_3d_diagnostics` reports acceptance
+or rejection reasons. Repeated rejected measurements hold the last valid global
+correction and report a degraded state; use `/initialpose` to recover from a
+lost or incorrect global hypothesis.
+
+When recovery is enabled, quality-valid ICP candidates rejected only by the
+translation, rotation, or Mahalanobis gates enter a confirmation stage. Two
+motion-aware consistent `map -> odom` candidates authorize bounded correction
+steps; weak, stale, or inconsistent matches still cannot move the filter. The
+G1 launch runs ICP once per second, requires fresh scan data, and limits each
+recovery step to 0.5 m and 0.15 rad. Diagnostics expose the recovery mode,
+candidate consistency, applied step, and localization overruns.
+
 Check rostopic by following command.
 
 ```
