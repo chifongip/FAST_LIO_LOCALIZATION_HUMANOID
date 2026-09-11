@@ -53,6 +53,13 @@ def generate_launch_description():
         'open3d_verbosity', default_value='warning',
         description='Open3D log level: debug, info, warning, or error'
     )
+    recovery_config_arg = DeclareLaunchArgument(
+        'recovery_config',
+        default_value=PathJoinSubstitution([
+            open3d_loc_share, 'config', 'recovery_param.yaml'
+        ]),
+        description='Recovery parameter overlay loaded after the tuned base YAML'
+    )
 
     # 配置文件路径
     config_file = PathJoinSubstitution([
@@ -93,6 +100,7 @@ def generate_launch_description():
         arguments=['--ros-args', '--log-level', 'global_localization_node:=error'],
         parameters=[
             config_file,
+            LaunchConfiguration('recovery_config'),
             {
                 'path_map': map_file,
                 'pcd_queue_maxsize': 10,
@@ -106,8 +114,6 @@ def generate_launch_description():
                 'maxpoints_source': 80000,
                 'maxpoints_target': 400000,
                 'filter_odom2map': False,
-                'fusion.enabled': True,
-                'fusion.recovery.enabled': True,
                 'kalman_processVar2': 0.001,
                 'kalman_estimatedMeasVar2': 0.02,
                 'confidence_loc_th': 0.7,
@@ -156,6 +162,7 @@ def generate_launch_description():
         tf_lookup_max_age_arg,
         legacy_static_frames_arg,
         open3d_verbosity_arg,
+        recovery_config_arg,
         static_tf_imulink2baselink,
         static_tf_base_center,
         global_localization_node,

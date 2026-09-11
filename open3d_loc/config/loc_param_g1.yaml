@@ -36,3 +36,5 @@ global_localization_node:
         max_candidate_rotation_delta: 0.20
         max_step_translation: 0.50
         max_step_rotation: 0.15
+        # Tolerates scheduler jitter on the nominal 10 Hz odometry stream.
+        max_odometry_gap: 0.15

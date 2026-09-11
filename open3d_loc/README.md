@@ -93,10 +93,100 @@ replacing the correction directly.
 
 ## Recovery parameters (`fusion.recovery`)
 
-Recovery is used only when ICP passes fitness, RMSE, correspondence, and age
-gates but fails a normal translation, rotation, or Mahalanobis gate. It does
-not create a global ICP hypothesis; it validates and safely applies one that
-the existing ICP has already found.
+The E1R launch forwards `recovery_config` to `open3d_loc_g1.launch.py`, which
+loads `config/recovery_param.yaml` after `config/loc_param_g1.yaml`. The base
+file retains its tuned values, including two consistent measurements. The
+default overlay explicitly selects reset recovery with three confirmations
+and three verification observations. Fusion enable flags are no longer
+overridden inline by the launch file, so custom overlays can disable them.
+
+```bash
+ros2 launch open3d_loc localization_3d_e1r.launch.py \
+  recovery_config:=/absolute/path/to/recovery_param.yaml
+```
+
+Custom overlays must use `global_localization_node: ros__parameters:` with
+the nested `fusion: recovery:` mapping, as in the supplied file. Set
+`application_mode: shadow` in a copy for evaluation without applying recovery
+resets. Shadow mode still permits normal fusion updates; it does not freeze
+the complete localization pipeline. `application_mode: reset` permits a
+confirmed correction to change `map -> odom` discontinuously. Local odometry
+is not reset, but downstream map-frame consumers must tolerate that jump.
+
+The robust recovery path searches a bounded translation/yaw region and
+checks candidates across fresh observations. A search is not a guarantee of
+relocalization: sparse geometry, repeated structures, an inaccurate map, and
+errors outside the search region can leave the node unrecovered. Candidate
+quality and observability checks remain necessary even for a high score.
+Search budgets bound scheduled work; a single registration call can overrun
+the requested budget. Measure actual latency on the deployment CPU.
+
+| Overlay key under `fusion.recovery` | Value | Purpose |
+| --- | --- | --- |
+| `application_mode` | `reset` | Apply confirmed recovery in one jump; `shadow` evaluates without applying recovery resets; `bounded_step` retains gradual corrections. Without the overlay, the node defaults to `bounded_step`. |
+| `required_consistent_measurements` | `3` | Consistent observations required for confirmation. |
+| `verification_observations` | `3` | Subsequent observations used for verification. |
+| `search_radius`, `vertical_range` | `6.0`, `1.0` | Horizontal and vertical search bounds in metres. |
+| `translation_step`, `yaw_step_degrees` | `2.0`, `30.0` | Translation sampling in metres and yaw sampling in degrees. |
+| `search_interval`, `failure_trigger` | `10.0`, `3` | Search cadence in seconds and failure trigger count. |
+| `search_budget_ms`, `timeout` | `500`, `20.0` | Integer work budget in milliseconds per one-second search batch, and total search timeout in seconds. Confirmation timeout remains `candidate_timeout`. |
+| `max_refined`, `max_candidates` | `16`, `4` | Refinement and retained-candidate limits. |
+| `score_advantage` | `0.15` | Required candidate score separation. |
+| `consistency_stddev_translation`, `consistency_stddev_rotation` | `0.15`, `0.05` | Consistency noise scales in metres and radians. |
+| `consistency_mahalanobis_threshold` | `16.812` | Statistical consistency gate. |
+| `max_odometry_gap` | `0.15` | Largest permissible gap between odometry samples in a recovery scan window. It accommodates normal 10 Hz scheduling jitter while still rejecting gaps that make scan-time motion interpolation unreliable. |
+| `observability_ratio` | `1e-4` | Minimum geometry observability ratio. |
+
+These are configuration defaults, not measured recovery accuracy or timing
+results. Validate using recorded data before deploying reset mode.
+
+### Reset-mode tuning and validation
+
+Start with a custom `shadow` overlay and inspect the
+`open3d_loc/global_relocalization` diagnostic status. The normal filter's
+innovation limits do not limit a confirmed reset. Do not raise those limits
+just to allow a large recovery jump.
+
+- If no good candidate is found, check map/scan overlap and extrinsics first.
+  Expand `search_radius` or `vertical_range` only when the expected error is
+  outside the search region. Yaw seeds already cover a full turn. Finer lattice
+  spacing increases work; inspect search duration and ranked/total seed counts
+  before increasing the timeout or work budget. Timed-out searches do not
+  supply partially ranked results for confirmation.
+- If candidates are ambiguous or poorly observable, more permissive filter
+  gates will not resolve the missing geometric evidence. Collect a view with
+  more distinctive three-dimensional structure. `score_advantage` compares
+  distinct quality-valid hypotheses on the same fresh scan, not scores from
+  different captures.
+- If confirmation is repeatedly stale or overlapping, inspect scan and odometry
+  timing before changing consistency thresholds. Windows must have disjoint scan
+  IDs, span at most 1.5 seconds, and have odometry interpolation gaps no larger
+  than `fusion.recovery.max_odometry_gap` (0.15 seconds by default). The final
+  scan-age gate is `fusion.max_measurement_age`.
+  The one-second localization cadence does not imply all stages use a one-second
+  interval; the search worker has its own cadence and budget.
+- If candidates disagree despite good geometry, examine the motion-compensated
+  residuals and covariance. Agreement is checked against both the first and
+  previous accepted observations, so normal robot motion is allowed but a
+  slowly wandering hypothesis cannot accumulate confirmation. Keep the overlay's
+  three confirmation and three verification observations for initial deployment.
+- Switch to `reset` only after inspecting false-reset cases as well as successful
+  recoveries. Failed post-reset verification enters degraded recovery; it does
+  not silently roll back to the old, potentially drifted pose.
+
+Search samples translation and yaw, while ICP can refine all six pose axes.
+`fusion.update_mask` still controls which components are applied. A masked pose
+is geometrically re-evaluated before resetting. The 6 m / 1 m search bounds are
+seed-generation bounds, not hard limits on ICP's final correction. This is
+bounded-region recovery, not a guarantee of localization anywhere in the map.
+
+### Legacy bounded-step base policy
+
+The following settings are retained in the base YAML. The step limits apply
+only to `bounded_step`; they do not bound a reset jump. Both application modes
+now use the new search and fresh-window validation. Search is triggered by
+rejected quality-valid tracking ICP, repeated quality failures, or the periodic
+watchdog; it does not depend solely on the tracking ICP finding a good hypothesis.
 
 | Parameter | Current value | Meaning and tuning effect |
 | --- | --- | --- |
@@ -110,7 +200,7 @@ the existing ICP has already found.
 | `max_step_translation` | `0.50` | Largest translation applied by each confirmed recovery cycle. Larger values recover faster but increase the impact of a false alignment. |
 | `max_step_rotation` | `0.15` | Largest rotation applied by each confirmed recovery cycle (~8.6 degrees). A stable 180-degree yaw candidate needs about 21 steps at this limit. |
 
-## Tuning workflow
+## Legacy bounded-step tuning workflow
 
 Change one group at a time, replay a representative bag, and record the
 diagnostics before changing another group. The diagnostics topic is
@@ -179,6 +269,50 @@ fusion:
 For a 180-degree yaw correction, this still requires a consistent ICP result
 and several bounded steps. It is intentionally not an immediate flip.
 
+## Offline recovery replay
+
+`relocalization_replay` is the C++ offline evaluator. It consumes a map PCD
+and a CSV manifest of registered scan PCDs, synchronized odometry, and
+reference poses. It exercises the recovery implementation; it is not a ROS
+bag player or a substitute for testing node scheduling, TF, and transport.
+
+```bash
+ros2 run open3d_loc relocalization_replay \
+  /data/map.pcd /data/manifest.csv /tmp/recovery_report.csv \
+  --inject 4 0 0 180
+```
+
+The injection arguments are `DX DY DZ YAW_DEGREES` (metres and degrees).
+Run a zero-error baseline as well as translation, yaw, and combined errors;
+include ambiguous and low-overlap scenes when assessing false recovery.
+Do not interpret a successful process exit as proof of correct localization.
+Compare the report's pose errors and recovery outcomes with the reference.
+
+The manifest has exactly these 16 columns; its header is optional:
+
+```csv
+stamp,scan_path,odom_x,odom_y,odom_z,odom_qx,odom_qy,odom_qz,odom_qw,reference_x,reference_y,reference_z,reference_qx,reference_qy,reference_qz,reference_qw
+```
+
+Capture strictly increasing timestamps in seconds. Scan paths resolve
+relative to the manifest directory. Each scan must already be expressed in
+the odom frame, with the matching `odom <- base` pose. Reference poses are
+`map <- base` at that same time; both pose columns must represent the same
+physical base frame. Account for sensor extrinsics and deskewing during
+export. Raw sensor-frame clouds cannot be substituted for registered clouds.
+The first reference pose initializes the baseline correction; later reference
+poses are used for scoring only, not to guide recovery. Thus this evaluates
+recovery from an injected error, not uninitialized global localization.
+
+Capture the exact map, scan timestamps, odometry, reference source and its
+uncertainty, build revision, and effective recovery settings alongside each
+report. A reference derived from the localization output being evaluated is
+not independent ground truth. Keep datasets outside the repository. This
+repository does not supply a representative captured dataset or establish a
+real-world recovery success rate; synthetic checks alone cannot establish one.
+The replay CLI is separate from ROS launch parameter loading: do not assume
+it consumes `recovery_config` unless that option is explicitly supported.
+
 ## Topic reference
 
 | Topic | Purpose |
@@ -187,4 +321,6 @@ and several bounded steps. It is intentionally not an immediate flip.
 | `/odom2map_icp` | Raw ICP `map -> odom` candidate and covariance. |
 | `/localization_3d_odom` | Fused map-frame output pose with covariance. |
 | `/localization_3d_diagnostics` | Fusion/recovery state, gates, candidate consistency, applied steps, and overrun count. |
+| `/global_relocalization_candidates` | Freshly evaluated candidate robot poses in `map`, stamped at the scan time. |
+| `/global_relocalization_reset` | Applied recovery robot pose and covariance in `map`; emitted for reset and bounded-step applications. |
 | `/localization_3d_confidence` | Published registration fitness. |

@@ -31,6 +31,13 @@ def generate_launch_description():
             'in the local ROS clock'
         )
     )
+    recovery_config_arg = DeclareLaunchArgument(
+        'recovery_config',
+        default_value=PathJoinSubstitution([
+            open3d_loc_share, 'config', 'recovery_param.yaml'
+        ]),
+        description='Recovery parameter overlay forwarded to global localization'
+    )
 
     fast_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
@@ -51,6 +58,7 @@ def generate_launch_description():
         ])),
         launch_arguments={
             'map_file': LaunchConfiguration('map_file'),
+            'recovery_config': LaunchConfiguration('recovery_config'),
             'use_sim_time': LaunchConfiguration('use_sim_time'),
             'imu_frame': 'lidar_imu_chest_front',
             'body_frame': 'base_link',
@@ -80,6 +88,7 @@ def generate_launch_description():
         use_sim_time_arg,
         start_rviz_arg,
         sensor_time_offset_arg,
+        recovery_config_arg,
         fast_lio_launch,
         localization_launch,
         rviz_node,

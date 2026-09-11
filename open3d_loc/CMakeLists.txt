@@ -125,6 +125,10 @@ ament_target_dependencies(open3d_conversions
 # Build global_localization_node
 add_library(global_correction_filter src/global_correction_filter.cpp)
 target_link_libraries(global_correction_filter Eigen3::Eigen)
+add_library(recovery_coordinator src/recovery_coordinator.cpp)
+target_link_libraries(recovery_coordinator global_correction_filter Eigen3::Eigen)
+add_library(recovery_search src/recovery_search.cpp)
+target_link_libraries(recovery_search ${Open3D_LIBRARIES} Eigen3::Eigen)
 
 add_executable(global_localization_node src/global_localization.cpp)
 target_link_libraries(global_localization_node
@@ -132,6 +136,8 @@ target_link_libraries(global_localization_node
         open3d_registration
         open3d_conversions
         global_correction_filter
+        recovery_coordinator
+        recovery_search
 )
 ament_target_dependencies(global_localization_node
         rclcpp
@@ -153,6 +159,8 @@ install(TARGETS
         open3d_registration
         open3d_conversions
         global_correction_filter
+        recovery_coordinator
+        recovery_search
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin
@@ -163,6 +171,10 @@ install(TARGETS
 
         DESTINATION lib/${PROJECT_NAME}
 )
+
+add_executable(relocalization_replay src/relocalization_replay.cpp)
+target_link_libraries(relocalization_replay recovery_search recovery_coordinator)
+install(TARGETS relocalization_replay DESTINATION lib/${PROJECT_NAME})
 
 # Install directories
 install(DIRECTORY
@@ -194,6 +206,13 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
         target_link_libraries(test_global_correction_filter global_correction_filter Eigen3::Eigen)
+
+        ament_add_gtest(test_recovery_coordinator test/test_recovery_coordinator.cpp)
+        target_link_libraries(test_recovery_coordinator recovery_coordinator)
+        ament_add_gtest(test_recovery_search test/test_recovery_search.cpp)
+        target_link_libraries(test_recovery_search recovery_search)
+        ament_add_gtest(test_relocalization_pipeline test/test_relocalization_pipeline.cpp)
+        target_link_libraries(test_relocalization_pipeline recovery_coordinator recovery_search)
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
 endif()

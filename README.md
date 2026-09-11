@@ -272,13 +272,16 @@ or rejection reasons. Repeated rejected measurements hold the last valid global
 correction and report a degraded state; use `/initialpose` to recover from a
 lost or incorrect global hypothesis.
 
-When recovery is enabled, quality-valid ICP candidates rejected only by the
-translation, rotation, or Mahalanobis gates enter a confirmation stage. Two
-motion-aware consistent `map -> odom` candidates authorize bounded correction
-steps; weak, stale, or inconsistent matches still cannot move the filter. The
-G1 launch runs ICP once per second, requires fresh scan data, and limits each
-recovery step to 0.5 m and 0.15 rad. Diagnostics expose the recovery mode,
-candidate consistency, applied step, and localization overruns.
+The E1R/G1 localization launch loads `config/recovery_param.yaml` after the
+tuned base configuration through the `recovery_config` argument. The overlay
+selects reset recovery, three consistent measurements, and three verification
+observations; the base YAML's two-measurement setting is preserved. A custom
+overlay can select `fusion.recovery.application_mode: shadow` to evaluate
+recovery without applying its resets. Normal fusion remains active in shadow
+mode. Reset recovery may jump `map -> odom`; legacy bounded-step limits do not
+limit that jump. Bounded search cannot guarantee recovery in ambiguous scenes
+or outside its search region. See [recovery configuration](open3d_loc/README.md#recovery-parameters-fusionrecovery)
+for parameters and validation requirements.
 
 Check rostopic by following command.
 

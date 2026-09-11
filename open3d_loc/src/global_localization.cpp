@@ -11,6 +11,7 @@
 #include <tf2_ros/static_transform_broadcaster.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
@@ -27,6 +28,8 @@
 #include <string>
 #include <array>
 #include <cstdint>
+#include <future>
+#include <atomic>
 // #include <pcl/common/transforms.h>
 
 #include <Eigen/Core>
@@ -38,6 +41,8 @@
 #include "open3d_conversions/open3d_conversions.h"
 #include "open3d_loc/transform_utils.hpp"
 #include "open3d_loc/global_correction_filter.hpp"
+#include "open3d_loc/recovery_coordinator.hpp"
+#include "open3d_loc/recovery_search.hpp"
 
 #define PI 3.1415926
 
@@ -264,13 +269,30 @@ public:
 
     struct MotionHistorySample
     {
-        rclcpp::Time stamp;
+        rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
         double cumulative_distance = 0.0;
         double cumulative_rotation = 0.0;
+        Eigen::Matrix4d odom_base = Eigen::Matrix4d::Identity();
+        open3d_loc::Matrix6d covariance = open3d_loc::Matrix6d::Zero();
+    };
+
+    struct ScanRecord
+    {
+        std::uint64_t id;
+        rclcpp::Time stamp;
+        open3d::geometry::PointCloud cloud;
+        std::uint64_t generation;
     };
 
     bool LookupMotionSampleLocked(
         const rclcpp::Time & stamp, MotionHistorySample & sample) const;
+    bool ProcessRecovery(
+        const open3d::geometry::PointCloud & cloud,
+        const std::vector<std::uint64_t> & scan_ids,
+        const rclcpp::Time & oldest_stamp, const rclcpp::Time & stamp,
+        std::uint64_t generation, const Eigen::Matrix4d & tracking_candidate,
+        const open3d_loc::Matrix6d & tracking_covariance, bool tracking_quality_valid);
+    void PublishRecoveryHeartbeat();
 
 private:
     /// @brief 订阅baselink2odom,即fast_lio的里程计信息
@@ -321,7 +343,8 @@ private:
     std::shared_ptr<open3d::geometry::PointCloud> pcd_map_cur_;
     std::shared_ptr<open3d::geometry::PointCloud> pcd_scan_cur_;
 
-    std::queue<open3d::geometry::PointCloud> que_pcd_scan_;
+    std::deque<ScanRecord> que_pcd_scan_;
+    std::uint64_t next_scan_id_ = 1;
     int queue_maxsize_;
     double voxelsize_coarse_;
     double voxelsize_fine_;
@@ -406,6 +429,7 @@ private:
     int fusion_min_correspondences_ = 100;
     int fusion_max_consecutive_rejections_ = 5;
     int fusion_rejection_count_ = 0;
+    double recovery_max_odometry_gap_ = 0.15;
     std::uint64_t fusion_generation_ = 0;
     rclcpp::Time latest_scan_stamp_{0, 0, RCL_ROS_TIME};
     rclcpp::Time last_processed_scan_stamp_{0, 0, RCL_ROS_TIME};
@@ -416,6 +440,38 @@ private:
     bool force_submap_refresh_ = false;
     double last_localization_duration_ms_ = 0.0;
     std::uint64_t localization_overrun_count_ = 0;
+    open3d_loc::RecoverySearchConfig recovery_search_config_;
+    std::unique_ptr<open3d_loc::RecoveryCoordinator> recovery_coordinator_;
+    std::unique_ptr<open3d_loc::RecoverySearch> recovery_evaluator_;
+    struct SearchResult
+    {
+        std::uint64_t generation = 0;
+        bool complete = false;
+        std::size_t ranked = 0;
+        std::size_t total = 0;
+        double duration_ms = 0.0;
+        std::vector<open3d_loc::RecoveryCandidate> candidates;
+    };
+    std::future<SearchResult> recovery_search_future_;
+    std::atomic<bool> recovery_stop_{false};
+    std::atomic<std::uint64_t> recovery_worker_generation_{0};
+    std::vector<open3d_loc::RecoveryCandidate> recovery_candidates_;
+    std::uint64_t recovery_seen_generation_ = 0;
+    std::chrono::steady_clock::time_point last_recovery_search_{};
+    double recovery_search_interval_ = 10.0;
+    double recovery_search_timeout_ = 20.0;
+    int recovery_search_budget_ms_ = 500;
+    int recovery_failure_trigger_ = 3;
+    int recovery_quality_failures_ = 0;
+    double recovery_score_advantage_ = 0.15;
+    double recovery_last_candidate_time_ = 0.0;
+    std::string recovery_application_mode_;
+    std::uint64_t recovery_reset_count_ = 0;
+    diagnostic_msgs::msg::DiagnosticStatus recovery_status_;
+    std::vector<diagnostic_msgs::msg::KeyValue> recovery_search_statistics_;
+    rclcpp::TimerBase::SharedPtr recovery_heartbeat_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_recovery_candidates_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pub_recovery_reset_;
 
     /// 1202
     /// @brief 上次更新定位时的定位值
@@ -470,6 +526,16 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     pub_localization_3d_odom_ = this->create_publisher<nav_msgs::msg::Odometry>("/localization_3d_odom", 10);
     pub_fusion_diagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
         "/localization_3d_diagnostics", 10);
+    pub_recovery_candidates_ = this->create_publisher<geometry_msgs::msg::PoseArray>(
+        "/global_relocalization_candidates", 10);
+    pub_recovery_reset_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        "/global_relocalization_reset", rclcpp::QoS(10).reliable());
+    recovery_status_.name = "open3d_loc/global_relocalization";
+    recovery_status_.hardware_id = "open3d_loc";
+    recovery_status_.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    recovery_status_.message = "waiting_for_fresh_scan_window";
+    recovery_heartbeat_ = this->create_wall_timer(std::chrono::seconds(1),
+        std::bind(&GloabalLocalization::PublishRecoveryHeartbeat, this));
 
     pub_map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "/global_map_3d", rclcpp::QoS(1).reliable().transient_local());
@@ -556,6 +622,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     this->declare_parameter<double>("fusion.recovery.max_candidate_rotation_delta", 0.20);
     this->declare_parameter<double>("fusion.recovery.max_step_translation", 0.50);
     this->declare_parameter<double>("fusion.recovery.max_step_rotation", 0.15);
+    this->declare_parameter<double>("fusion.recovery.max_odometry_gap", 0.15);
     // voxelsize
     this->declare_parameter<double>("voxelsize_coarse", 0.2);
     this->declare_parameter<double>("voxelsize_fine", 0.05);
@@ -628,6 +695,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
         "fusion.recovery.max_step_translation", fusion_config_.recovery.max_step_translation);
     this->get_parameter(
         "fusion.recovery.max_step_rotation", fusion_config_.recovery.max_step_rotation);
+    this->get_parameter("fusion.recovery.max_odometry_gap", recovery_max_odometry_gap_);
     fusion_shared_lidar_covariance_scale_ =
         std::max(fusion_shared_lidar_covariance_scale_, 1.0);
     fusion_max_measurement_age_ = std::max(fusion_max_measurement_age_, 0.0);
@@ -640,6 +708,8 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
         std::max(fusion_config_.max_innovation_rotation, 0.0);
     fusion_config_.mahalanobis_threshold =
         std::max(fusion_config_.mahalanobis_threshold, 0.0);
+    if (!std::isfinite(recovery_max_odometry_gap_) || recovery_max_odometry_gap_ <= 0.0)
+        throw std::invalid_argument("fusion.recovery.max_odometry_gap must be finite and positive");
     if (fusion_update_mask.size() == 6)
     {
         for (int i = 0; i < 6; ++i)
@@ -680,8 +750,63 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     RCLCPP_INFO(this->get_logger(), "  filter_odom2map: %s", filter_odom2map_ ? "true" : "false");
     this->get_parameter("voxelsize_coarse", voxelsize_coarse_);
     this->get_parameter("voxelsize_fine", voxelsize_fine_);
+    recovery_search_config_.fine_voxel = voxelsize_fine_;
+    recovery_search_config_.fine_distance = 2.0 * voxelsize_fine_;
+    recovery_search_config_.xy_radius = this->declare_parameter<double>(
+        "fusion.recovery.search_radius", 6.0);
+    recovery_search_config_.z_radius = this->declare_parameter<double>(
+        "fusion.recovery.vertical_range", 1.0);
+    recovery_search_config_.xy_step = this->declare_parameter<double>(
+        "fusion.recovery.translation_step", 2.0);
+    recovery_search_config_.yaw_step_degrees = this->declare_parameter<double>(
+        "fusion.recovery.yaw_step_degrees", 30.0);
+    recovery_search_interval_ = this->declare_parameter<double>(
+        "fusion.recovery.search_interval", 10.0);
+    recovery_search_timeout_ = this->declare_parameter<double>("fusion.recovery.timeout", 20.0);
+    recovery_search_budget_ms_ = this->declare_parameter<int>("fusion.recovery.search_budget_ms", 500);
+    recovery_failure_trigger_ = this->declare_parameter<int>("fusion.recovery.failure_trigger", 3);
+    const int max_refined = this->declare_parameter<int>("fusion.recovery.max_refined", 16);
+    const int max_candidates = this->declare_parameter<int>("fusion.recovery.max_candidates", 4);
+    recovery_score_advantage_ = this->declare_parameter<double>("fusion.recovery.score_advantage", 0.15);
+    recovery_search_config_.min_information_ratio = this->declare_parameter<double>(
+        "fusion.recovery.observability_ratio", 1e-4);
+    if (max_refined < 1 || max_candidates < 1 || max_candidates > 4 || recovery_search_budget_ms_ < 1 ||
+        recovery_search_budget_ms_ > 1000 || recovery_failure_trigger_ < 1 ||
+        !std::isfinite(recovery_search_interval_) || recovery_search_interval_ <= 0.0 ||
+        !std::isfinite(recovery_search_timeout_) || recovery_search_timeout_ <= 0.0 ||
+        !std::isfinite(recovery_score_advantage_) || recovery_score_advantage_ < 0.0 ||
+        recovery_score_advantage_ >= 1.0)
+        throw std::invalid_argument("Invalid recovery search scheduling or score parameters");
+    recovery_search_config_.refine_count = static_cast<std::size_t>(max_refined);
+    recovery_search_config_.candidate_count = static_cast<std::size_t>(max_candidates);
+    recovery_search_config_.max_rmse = fusion_max_icp_rmse_;
+    recovery_search_config_.min_correspondences = static_cast<std::size_t>(fusion_min_correspondences_);
     this->get_parameter("threshold_fitness_init", threshold_fitness_init_);
     this->get_parameter("threshold_fitness", threshold_fitness_);
+    recovery_search_config_.min_fitness = threshold_fitness_;
+    recovery_search_config_.update_mask = fusion_config_.update_mask;
+    recovery_search_config_.covariance_scale = fusion_shared_lidar_covariance_scale_;
+    open3d_loc::RecoveryCoordinatorConfig recovery_config;
+    recovery_config.application_mode = this->declare_parameter<std::string>(
+        "fusion.recovery.application_mode", "bounded_step");
+    recovery_application_mode_ = recovery_config.application_mode;
+    if (recovery_application_mode_ == "bounded") recovery_application_mode_ = "bounded_step";
+    recovery_config.required_observations = fusion_config_.recovery.required_consistent_measurements;
+    recovery_config.verification_observations = this->declare_parameter<int>(
+        "fusion.recovery.verification_observations", 3);
+    recovery_config.translation_stddev = this->declare_parameter<double>(
+        "fusion.recovery.consistency_stddev_translation", 0.15);
+    recovery_config.rotation_stddev = this->declare_parameter<double>(
+        "fusion.recovery.consistency_stddev_rotation", 0.05);
+    recovery_config.minimum_interval = fusion_config_.recovery.minimum_candidate_interval;
+    recovery_config.timeout = fusion_config_.recovery.candidate_timeout;
+    recovery_config.translation_limit = fusion_config_.recovery.max_candidate_translation_delta;
+    recovery_config.rotation_limit = fusion_config_.recovery.max_candidate_rotation_delta;
+    recovery_config.mahalanobis_threshold = fusion_config_.recovery.consistency_mahalanobis_threshold;
+    recovery_config.max_step_translation = fusion_config_.recovery.max_step_translation;
+    recovery_config.max_step_rotation = fusion_config_.recovery.max_step_rotation;
+    recovery_config.update_mask = fusion_config_.update_mask;
+    recovery_coordinator_ = std::make_unique<open3d_loc::RecoveryCoordinator>(recovery_config);
     this->get_parameter("initialpose", initialpose_);
     this->get_parameter("dis_updatemap", dis_updatemap_);
     this->get_parameter("imu_frame", imu_frame_);
@@ -743,11 +868,14 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
 
 GloabalLocalization::~GloabalLocalization()
 {
+    recovery_stop_ = true;
     lock_exit_.lock();
     flag_exit_ = true;
     lock_exit_.unlock();
     if (thread_loc_.joinable())
         thread_loc_.join();
+    if (recovery_search_future_.valid())
+        recovery_search_future_.wait();
 }
 
 Eigen::Matrix3d GloabalLocalization::Euler2Matrix3d(const Eigen::Vector3d euler)
@@ -866,12 +994,22 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
 
         const bool timestamp_rollback =
             !motion_history_.empty() && odom_stamp < motion_history_.back().stamp;
-        if (timestamp_rollback)
+        const bool odometry_jump = have_odom_ &&
+            (distance > std::max(1.0, 5.0 * std::max(dt, 0.0)) ||
+            rotation > std::max(0.7, 4.0 * std::max(dt, 0.0)));
+        if (timestamp_rollback || odometry_jump)
         {
             motion_history_.clear();
             cumulative_odom_distance_ = 0.0;
             cumulative_odom_rotation_ = 0.0;
             correction_filter_.clearRecovery();
+            ++fusion_generation_;
+            recovery_worker_generation_ = fusion_generation_;
+            std::lock_guard<std::mutex> scan_lock(lock_scan_);
+            que_pcd_scan_.clear();
+            pcd_scan_cur_->Clear();
+            last_processed_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+            dt = distance = rotation = 0.0;
         }
         else if (have_odom_ &&
             (motion_history_.empty() || odom_stamp > motion_history_.back().stamp))
@@ -882,9 +1020,9 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         if (motion_history_.empty() || odom_stamp > motion_history_.back().stamp)
         {
             motion_history_.push_back(
-                MotionHistorySample{odom_stamp, cumulative_odom_distance_, cumulative_odom_rotation_});
-            const double history_duration = std::max(
-                10.0, fusion_config_.recovery.candidate_timeout + 2.0);
+                MotionHistorySample{odom_stamp, cumulative_odom_distance_, cumulative_odom_rotation_,
+                    mat_body_to_odom, RosPoseCovariance(*baselink2odom)});
+            const double history_duration = 30.0;
             while (motion_history_.size() > 1 &&
                 (odom_stamp - motion_history_.front().stamp).seconds() > history_duration)
             {
@@ -1062,21 +1200,29 @@ void GloabalLocalization::CallbackScan(
     open3d::geometry::PointCloud pcd_recieved;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr const_scan_ptr = scan_in_baselink;
     open3d_conversions::rosToOpen3d(const_scan_ptr, pcd_recieved);
-    std::lock_guard<std::mutex> lock(lock_scan_);
+    std::scoped_lock lock(lock_state_, lock_scan_);
+    const rclcpp::Time stamp(scan_in_baselink->header.stamp);
+    if (!que_pcd_scan_.empty() && stamp <= que_pcd_scan_.back().stamp)
+    {
+        if (stamp == que_pcd_scan_.back().stamp)
+            return;
+        que_pcd_scan_.clear();
+        pcd_scan_cur_->Clear();
+        last_processed_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        ++fusion_generation_;
+        recovery_worker_generation_ = fusion_generation_;
+    }
     if (que_pcd_scan_.size() >= static_cast<std::size_t>(queue_maxsize_))
-        que_pcd_scan_.pop();
-    que_pcd_scan_.push(std::move(pcd_recieved));
+        que_pcd_scan_.pop_front();
+    que_pcd_scan_.push_back(ScanRecord{
+        next_scan_id_++, stamp, std::move(pcd_recieved), fusion_generation_});
     latest_scan_stamp_ = scan_in_baselink->header.stamp;
 
     if (que_pcd_scan_.size() == static_cast<std::size_t>(queue_maxsize_))
     {
         pcd_scan_cur_->Clear();
-        std::queue<open3d::geometry::PointCloud> snapshot = que_pcd_scan_;
-        while (!snapshot.empty())
-        {
-            *pcd_scan_cur_ += snapshot.front();
-            snapshot.pop();
-        }
+        for (const auto & record : que_pcd_scan_)
+            *pcd_scan_cur_ += record.cloud;
     }
 }
 
@@ -1112,7 +1258,7 @@ void GloabalLocalization::LocalizationInitialize()
     double fitness_initial; /// overlap
     double loc_cost = 0;    /// 定位耗时(ms)
     int count_success = 0;
-    while (rclcpp::ok())
+    while (rclcpp::ok() && !recovery_stop_)
     {
         auto loc_s = std::chrono::high_resolution_clock::now(); /// 开始定位计时
         lock_scan_.lock();
@@ -1202,7 +1348,7 @@ void GloabalLocalization::Localization()
 {
     RCLCPP_INFO(this->get_logger(), "wait for Odometry_loc");
     // 等待接收到第一条里程计消息（通过检查timestamp是否有效）
-    while (rclcpp::ok())
+    while (rclcpp::ok() && !recovery_stop_)
     {
         bool have_odom = false;
         {
@@ -1214,11 +1360,12 @@ void GloabalLocalization::Localization()
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Waiting for Odometry_loc...");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    if (!rclcpp::ok() || recovery_stop_) return;
     RCLCPP_INFO(this->get_logger(), "Received Odometry_loc");
 
     RCLCPP_INFO(this->get_logger(), "wait for cloud_registered_1");
     // 等待接收到第一条点云消息（通过检查pcd_scan_cur_是否为空）
-    while (rclcpp::ok())
+    while (rclcpp::ok() && !recovery_stop_)
     {
         lock_scan_.lock();
         bool has_scan = !pcd_scan_cur_->IsEmpty();
@@ -1230,6 +1377,7 @@ void GloabalLocalization::Localization()
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Waiting for cloud_registered_1...");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    if (!rclcpp::ok() || recovery_stop_) return;
     RCLCPP_INFO(this->get_logger(), "Received cloud_registered_1");
 
     // initialize
@@ -1240,6 +1388,7 @@ void GloabalLocalization::Localization()
         mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
     }
     LocalizationInitialize();
+    if (!rclcpp::ok() || recovery_stop_) return;
 
     /// 卡尔曼滤波初始化
     /// 使用当前 baselink2map 位置初始化卡尔曼滤波器
@@ -1279,6 +1428,7 @@ void GloabalLocalization::Localization()
         {
             correction_filter_.reset(mat_odom2map_);
             ++fusion_generation_;
+            recovery_worker_generation_ = fusion_generation_;
             {
                 std::lock_guard<std::mutex> timestamp_lock(lock_timestamp_);
                 last_fusion_prediction_stamp_ = timestamp_odom_;
@@ -1325,7 +1475,7 @@ void GloabalLocalization::Localization()
     std::chrono::high_resolution_clock::time_point time_last_loc; /// 上次定位的完成时间点
     std::chrono::high_resolution_clock::time_point time_this_loc; /// 当前定位的开始时间点
     double loc_cost = 0;                                          /// 定位耗时(ms)
-    while (rclcpp::ok())
+    while (rclcpp::ok() && !recovery_stop_)
     {
 
         lock_timestamp_.lock();
@@ -1335,7 +1485,7 @@ void GloabalLocalization::Localization()
         time_last = time_current;
         if (std::fabs(time_diff_frame) < 1e-6)
         {
-            loc_cost = 0.0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
@@ -1368,6 +1518,8 @@ void GloabalLocalization::Localization()
             Eigen::Matrix4d mat_baselink2odom_cur = Eigen::Matrix4d::Identity();
             Eigen::Matrix4d mat_baselink2map_cur = Eigen::Matrix4d::Identity();
             rclcpp::Time scan_stamp;
+            rclcpp::Time oldest_scan_stamp(0, 0, RCL_ROS_TIME);
+            std::vector<std::uint64_t> scan_ids;
             std::uint64_t fusion_generation = 0;
             bool force_submap_refresh = false;
 
@@ -1379,12 +1531,35 @@ void GloabalLocalization::Localization()
                 continue;
             }
             *pcd_scan = *pcd_scan_cur_;
+            if (!que_pcd_scan_.empty())
+            {
+                oldest_scan_stamp = que_pcd_scan_.front().stamp;
+                fusion_generation = que_pcd_scan_.back().generation;
+            }
+            for (const auto & record : que_pcd_scan_)
+                scan_ids.push_back(record.id);
+            for (const auto & record : que_pcd_scan_)
+                if (record.generation != fusion_generation)
+                    scan_ids.clear();
             last_processed_scan_stamp_ = scan_stamp;
             lock_scan_.unlock();
 
             Eigen::Matrix4d reg_matrix = Eigen::Matrix4d::Identity();
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
+                if (fusion_generation != fusion_generation_)
+                    continue;
+                MotionHistorySample snapshot_motion;
+                if (LookupMotionSampleLocked(scan_stamp, snapshot_motion))
+                {
+                    mat_baselink2odom_cur = snapshot_motion.odom_base;
+                    mat_baselink2map_cur = mat_odom2map_ * snapshot_motion.odom_base;
+                }
+                else
+                {
+                    mat_baselink2odom_cur = mat_baselink2odom_;
+                    mat_baselink2map_cur = mat_baselink2map_;
+                }
                 if (!fusion_enabled_ && filter_odom2map_)
                 {
                     kalman_filter_odom2map_.inputLatestNoisyMeasurement(mat_odom2map_(2, 3));
@@ -1392,8 +1567,6 @@ void GloabalLocalization::Localization()
                     mat_odom2map_kalman_ = mat_odom2map_;
                     mat_odom2map_kalman_(2, 3) = kalman_filter_odom2map_.getLatestEstimatedMeasurement();
                 }
-                mat_baselink2odom_cur = mat_baselink2odom_;
-                mat_baselink2map_cur = mat_baselink2map_;
                 reg_matrix = mat_odom2map_;
                 fusion_generation = fusion_generation_;
                 force_submap_refresh = force_submap_refresh_;
@@ -1467,16 +1640,35 @@ void GloabalLocalization::Localization()
                 pub_odom2map_icp_->publish(icp_odometry);
             }
 
+            const bool tracking_quality_valid = std::isfinite(localization_fitness) &&
+                localization_fitness > threshold_fitness_ && std::isfinite(eva_result2.inlier_rmse_) &&
+                eva_result2.inlier_rmse_ <= fusion_max_icp_rmse_ &&
+                correspondence_count >= static_cast<std::size_t>(fusion_min_correspondences_);
+            bool reset_applied = false;
+            if (fusion_enabled_ && fusion_config_.recovery.enabled)
+            {
+                try
+                {
+                    reset_applied = ProcessRecovery(*pcd_scan, scan_ids, oldest_scan_stamp,
+                        scan_stamp, fusion_generation, reg_matrix, measurement_covariance, tracking_quality_valid);
+                }
+                catch (const std::exception & error)
+                {
+                    std::lock_guard<std::mutex> lock(lock_state_);
+                    recovery_status_.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+                    recovery_status_.message = std::string("recovery_error: ") + error.what();
+                    recovery_coordinator_->rejectedProposal();
+                }
+            }
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
                 loc_fitness_ = localization_fitness;
                 bool correction_accepted = false;
-                bool recovery_applied = false;
+                bool recovery_applied = reset_applied;
                 std::string diagnostic_reason = fusion_enabled_ ? "not_evaluated" : "fusion_disabled";
                 std::string normal_rejection_reason;
                 open3d_loc::CorrectionUpdateResult update_result;
-                open3d_loc::RecoveryUpdateResult recovery_result;
-                if (fusion_enabled_)
+                if (fusion_enabled_ && !reset_applied)
                 {
                     std::string rejection_reason;
                     if (fusion_generation != fusion_generation_)
@@ -1489,7 +1681,7 @@ void GloabalLocalization::Localization()
                     else if (correspondence_count < static_cast<std::size_t>(fusion_min_correspondences_))
                         rejection_reason = "correspondence_gate";
                     else if (!std::isfinite(measurement_age) || measurement_age < 0.0 ||
-                        measurement_age > fusion_max_measurement_age_)
+                        (this->now() - scan_stamp).seconds() > fusion_max_measurement_age_)
                         rejection_reason = "stale_measurement";
 
                     if (rejection_reason.empty())
@@ -1512,36 +1704,6 @@ void GloabalLocalization::Localization()
                         {
                             rejection_reason = update_result.reason;
                             normal_rejection_reason = update_result.reason;
-                            if (fusion_config_.recovery.enabled &&
-                                IsRecoverableFilterRejection(update_result.reason))
-                            {
-                                MotionHistorySample motion_sample;
-                                if (LookupMotionSampleLocked(scan_stamp, motion_sample))
-                                {
-                                    recovery_result = correction_filter_.observeRecoveryCandidate(
-                                        reg_matrix, measurement_covariance, scan_stamp.seconds(),
-                                        motion_sample.cumulative_distance,
-                                        motion_sample.cumulative_rotation);
-                                    diagnostic_reason = recovery_result.reason;
-                                    if (recovery_result.correction_applied)
-                                    {
-                                        mat_odom2map_ = correction_filter_.pose();
-                                        mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
-                                        force_submap_refresh_ = true;
-                                        fusion_rejection_count_ = 0;
-                                        recovery_applied = true;
-                                        RCLCPP_WARN(this->get_logger(),
-                                            "Applied bounded recovery correction: translation=%.3fm rotation=%.3frad",
-                                            recovery_result.applied_translation,
-                                            recovery_result.applied_rotation);
-                                    }
-                                }
-                                else
-                                {
-                                    correction_filter_.clearRecovery();
-                                    diagnostic_reason = "recovery_motion_unavailable";
-                                }
-                            }
                         }
                     }
                     if (!rejection_reason.empty() && !recovery_applied)
@@ -1555,7 +1717,7 @@ void GloabalLocalization::Localization()
                             correspondence_count, measurement_age);
                     }
                 }
-                else if (localization_fitness > threshold_fitness_)
+                else if (!fusion_enabled_ && localization_fitness > threshold_fitness_)
                 {
                     mat_odom2map_ = reg_matrix;
                     mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
@@ -1576,7 +1738,7 @@ void GloabalLocalization::Localization()
                     else if (recovery_applied)
                     {
                         status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-                        status.message = "Bounded recovery correction applied";
+                        status.message = "Global recovery correction applied";
                     }
                     else if (fusion_rejection_count_ >= fusion_max_consecutive_rejections_)
                     {
@@ -1591,8 +1753,8 @@ void GloabalLocalization::Localization()
                     status.values.push_back(DiagnosticValue("reason", diagnostic_reason));
                     status.values.push_back(DiagnosticValue(
                         "fusion_mode",
-                        open3d_loc::GlobalCorrectionFilter::recoveryModeName(
-                            correction_filter_.recoveryMode())));
+                        open3d_loc::RecoveryCoordinator::stateName(
+                            recovery_coordinator_->state())));
                     status.values.push_back(DiagnosticValue(
                         "normal_rejection_reason", normal_rejection_reason));
                     status.values.push_back(DiagnosticValue("fitness", std::to_string(localization_fitness)));
@@ -1604,31 +1766,7 @@ void GloabalLocalization::Localization()
                         "consecutive_rejections", std::to_string(fusion_rejection_count_)));
                     status.values.push_back(DiagnosticValue(
                         "recovery_candidate_count",
-                        std::to_string(correction_filter_.recoveryCandidateCount())));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_candidate_interval",
-                        std::to_string(recovery_result.candidate_interval)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_motion_distance",
-                        std::to_string(recovery_result.motion_distance)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_motion_rotation",
-                        std::to_string(recovery_result.motion_rotation)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_candidate_translation_delta",
-                        std::to_string(recovery_result.candidate_translation_delta)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_candidate_rotation_delta",
-                        std::to_string(recovery_result.candidate_rotation_delta)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_consistency_mahalanobis",
-                        std::to_string(recovery_result.consistency_mahalanobis_distance)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_applied_translation",
-                        std::to_string(recovery_result.applied_translation)));
-                    status.values.push_back(DiagnosticValue(
-                        "recovery_applied_rotation",
-                        std::to_string(recovery_result.applied_rotation)));
+                        std::to_string(recovery_coordinator_->count())));
                     status.values.push_back(DiagnosticValue(
                         "previous_localization_duration_ms",
                         std::to_string(last_localization_duration_ms_)));
@@ -1669,6 +1807,303 @@ void GloabalLocalization::Localization()
 void GloabalLocalization::StartLoc()
 {
     thread_loc_ = std::thread(&GloabalLocalization::Localization, this);
+}
+
+bool GloabalLocalization::ProcessRecovery(
+    const open3d::geometry::PointCloud & cloud,
+    const std::vector<std::uint64_t> & scan_ids,
+    const rclcpp::Time & oldest_stamp, const rclcpp::Time & stamp,
+    std::uint64_t generation, const Eigen::Matrix4d & tracking_candidate,
+    const open3d_loc::Matrix6d & tracking_covariance, bool tracking_quality_valid)
+{
+    using namespace open3d_loc;
+    using Clock = std::chrono::steady_clock;
+    MotionHistorySample motion, oldest_motion;
+    Eigen::Matrix4d incumbent;
+    bool normal_rejected = false;
+    bool verifying = false;
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        if (generation != fusion_generation_) return false;
+        if (recovery_seen_generation_ != generation)
+        {
+            recovery_candidates_.clear();
+            recovery_coordinator_->invalidate(generation);
+            recovery_seen_generation_ = generation;
+            recovery_worker_generation_ = generation;
+            recovery_quality_failures_ = 0;
+        }
+        recovery_coordinator_->expire(this->now().seconds());
+        if (scan_ids.empty() || (stamp - oldest_stamp).seconds() > 1.5 ||
+            !LookupMotionSampleLocked(stamp, motion) ||
+            !LookupMotionSampleLocked(oldest_stamp, oldest_motion))
+        {
+            recovery_status_.message = "missing_motion_or_fresh_window";
+            recovery_status_.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            return false;
+        }
+        for (std::size_t i = 1; i < motion_history_.size(); ++i)
+            if (motion_history_[i].stamp >= oldest_stamp && motion_history_[i - 1].stamp <= stamp &&
+                (motion_history_[i].stamp - motion_history_[i - 1].stamp).seconds() >
+                recovery_max_odometry_gap_)
+            {
+                recovery_status_.message = "odometry_gap_in_window";
+                return false;
+            }
+        incumbent = mat_odom2map_;
+        auto probe = correction_filter_;
+        normal_rejected = tracking_quality_valid && IsRecoverableFilterRejection(
+            probe.update(tracking_candidate, tracking_covariance).reason);
+        verifying = recovery_coordinator_->state() == RelocalizationState::VERIFYING;
+    }
+    if (!recovery_evaluator_)
+        recovery_evaluator_ = std::make_unique<RecoverySearch>(
+            *pcd_map_fine_, cloud, motion.odom_base, incumbent, recovery_search_config_);
+
+    if (recovery_search_future_.valid() &&
+        recovery_search_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        const auto result = recovery_search_future_.get();
+        if (result.generation == generation)
+        {
+            // Even a completed old search supplies seeds only, never confirmation evidence.
+            if (result.complete)
+                recovery_candidates_ = result.candidates;
+            recovery_last_candidate_time_ = stamp.seconds();
+            std::lock_guard<std::mutex> lock(lock_state_);
+            recovery_search_statistics_ = {
+                DiagnosticValue("search_complete", result.complete ? "true" : "false"),
+                DiagnosticValue("search_ranked_seeds", std::to_string(result.ranked)),
+                DiagnosticValue("search_total_seeds", std::to_string(result.total)),
+                DiagnosticValue("search_duration_ms", std::to_string(result.duration_ms))};
+        }
+    }
+    recovery_quality_failures_ = tracking_quality_valid ? 0 : recovery_quality_failures_ + 1;
+    const double since_search = std::chrono::duration<double>(Clock::now() - last_recovery_search_).count();
+    if (!recovery_search_future_.valid() && !verifying &&
+        (since_search >= recovery_search_interval_ || normal_rejected ||
+        recovery_quality_failures_ >= recovery_failure_trigger_))
+    {
+        auto cached_map = recovery_evaluator_->map();
+        const auto search_config = recovery_search_config_;
+        last_recovery_search_ = Clock::now();
+        recovery_search_future_ = std::async(std::launch::async,
+            [this, cached_map, cloud, motion, incumbent, generation, search_config]()
+            {
+                SearchResult result; result.generation = generation;
+                const auto start = Clock::now();
+                RecoverySearch search(cached_map, cloud, motion.odom_base, incumbent, search_config);
+                while (!recovery_stop_ && recovery_worker_generation_ == generation && !search.done() &&
+                    std::chrono::duration<double>(Clock::now() - start).count() < recovery_search_timeout_)
+                {
+                    const auto cycle = Clock::now();
+                    search.tick(std::chrono::milliseconds(recovery_search_budget_ms_), 100000);
+                    // Cooperative wait makes shutdown and reset cancel a search promptly.
+                    while (!search.done() && !recovery_stop_ && recovery_worker_generation_ == generation &&
+                        Clock::now() - cycle < std::chrono::seconds(1))
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+                result.complete = search.done();
+                result.ranked = search.rankedSeedCount(); result.total = search.totalSeedCount();
+                result.candidates = search.candidates();
+                result.duration_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                return result;
+            });
+        std::lock_guard<std::mutex> lock(lock_state_);
+        recovery_coordinator_->searching();
+    }
+
+    if (!verifying && !normal_rejected && recovery_candidates_.empty()) return false;
+    std::vector<RecoveryCandidate> evaluated;
+    evaluated.push_back(recovery_evaluator_->evaluateFresh(cloud, motion.odom_base, incumbent));
+    if (!verifying)
+    {
+        evaluated.push_back(recovery_evaluator_->evaluateFresh(cloud, motion.odom_base, tracking_candidate));
+        for (const auto & seed : recovery_candidates_)
+            evaluated.push_back(recovery_evaluator_->refineFresh(cloud, motion.odom_base, seed.map_odom));
+    }
+    std::stable_sort(evaluated.begin(), evaluated.end(), [](const auto & a, const auto & b) {
+        return a.score < b.score;
+    });
+    std::vector<RecoveryCandidate> distinct_candidates;
+    for (const auto & candidate : evaluated)
+    {
+        bool unique = true;
+        const Eigen::Matrix4d pose = candidate.map_odom * motion.odom_base;
+        for (const auto & other : distinct_candidates)
+        {
+            const Eigen::Matrix4d other_pose = other.map_odom * motion.odom_base;
+            if ((pose.block<3, 1>(0, 3) - other_pose.block<3, 1>(0, 3)).norm() <= 0.3 &&
+                Eigen::AngleAxisd(pose.block<3, 3>(0, 0) * other_pose.block<3, 3>(0, 0).transpose()).angle() <= 5.0 * M_PI / 180.0)
+                unique = false;
+        }
+        if (unique) distinct_candidates.push_back(candidate);
+    }
+    auto best = std::find_if(distinct_candidates.begin(), distinct_candidates.end(), [](const auto & c) {return c.accepted;});
+    if (best == distinct_candidates.end()) best = distinct_candidates.begin();
+    if (best == distinct_candidates.end()) return false;
+    bool unambiguous = true;
+    double advantage = 1.0;
+    for (const auto & candidate : distinct_candidates)
+    {
+        // A quality-valid alternative is evidence of ambiguity even when its
+        // geometry is too weak to authorize a reset of its own.
+        const bool quality_valid = std::isfinite(candidate.score) &&
+            candidate.fitness > threshold_fitness_ && candidate.rmse <= fusion_max_icp_rmse_ &&
+            candidate.correspondences >= static_cast<std::size_t>(fusion_min_correspondences_);
+        if (&candidate == &*best || !quality_valid) continue;
+        const double margin = (candidate.score - best->score) / std::max(1e-12, candidate.score);
+        advantage = std::min(advantage, margin);
+        if (margin < recovery_score_advantage_) unambiguous = false;
+    }
+    RecoveryObservation observation;
+    observation.generation = generation; observation.stamp = stamp.seconds();
+    observation.oldest_stamp = oldest_stamp.seconds(); observation.scan_ids = scan_ids;
+    observation.odom_base = motion.odom_base; observation.map_base = best->map_odom * motion.odom_base;
+    observation.covariance = best->covariance; observation.odom_covariance = motion.covariance;
+    observation.quality_valid = best->fitness > threshold_fitness_ && best->rmse <= fusion_max_icp_rmse_ &&
+        best->correspondences >= static_cast<std::size_t>(fusion_min_correspondences_);
+    observation.observable = best->information_ratio >= recovery_search_config_.min_information_ratio;
+    observation.unambiguous = unambiguous;
+    geometry_msgs::msg::PoseArray candidates_message;
+    candidates_message.header.frame_id = "map"; candidates_message.header.stamp = stamp;
+    for (const auto & candidate : distinct_candidates)
+    {
+        Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+        pose.matrix() = candidate.map_odom * motion.odom_base;
+        candidates_message.poses.push_back(tf2::toMsg(pose));
+    }
+    pub_recovery_candidates_->publish(candidates_message);
+    RecoveryDecision decision;
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        const double age = (this->now() - stamp).seconds();
+        if (generation != fusion_generation_ || age < 0 || age > fusion_max_measurement_age_)
+        {
+            recovery_status_.message = "stale_confirmation_or_generation";
+            return false;
+        }
+        const Eigen::Matrix4d current_robot = mat_odom2map_ * motion.odom_base;
+        const bool equivalent_to_incumbent =
+            (observation.map_base.block<3, 1>(0, 3) - current_robot.block<3, 1>(0, 3)).norm() <=
+            recovery_search_config_.dedup_translation &&
+            Eigen::AngleAxisd(observation.map_base.block<3, 3>(0, 0) *
+            current_robot.block<3, 3>(0, 0).transpose()).angle() <=
+            recovery_search_config_.dedup_angle_degrees * M_PI / 180.0;
+        if (!verifying && best->accepted && equivalent_to_incumbent)
+        {
+            // Watchdog searches may rediscover the already tracked pose. Such
+            // evidence is not a reason to reset the filter or its covariance.
+            recovery_coordinator_->invalidate(generation);
+            recovery_candidates_.clear();
+            recovery_status_.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+            recovery_status_.message = "no_recovery_needed";
+            return false;
+        }
+        decision = recovery_coordinator_->observe(observation, mat_odom2map_);
+        recovery_status_.message = decision.reason;
+        recovery_status_.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        recovery_status_.values = {
+            DiagnosticValue("state", RecoveryCoordinator::stateName(recovery_coordinator_->state())),
+            DiagnosticValue("candidate_count", std::to_string(decision.count)),
+            DiagnosticValue("candidate_fitness", std::to_string(best->fitness)),
+            DiagnosticValue("candidate_rmse", std::to_string(best->rmse)),
+            DiagnosticValue("candidate_score", std::to_string(best->score)),
+            DiagnosticValue("score_advantage", std::to_string(advantage)),
+            DiagnosticValue("information_ratio", std::to_string(best->information_ratio)),
+            DiagnosticValue("translation_residual", std::to_string(decision.translation_residual)),
+            DiagnosticValue("rotation_residual", std::to_string(decision.rotation_residual)),
+            DiagnosticValue("consistency_mahalanobis", std::to_string(decision.mahalanobis)),
+            DiagnosticValue("reset_count", std::to_string(recovery_reset_count_)),
+            DiagnosticValue("search_running", recovery_search_future_.valid() ? "true" : "false"),
+            DiagnosticValue("search_radius", std::to_string(recovery_search_config_.xy_radius))};
+    }
+    recovery_candidates_.clear();
+    if (!verifying)
+        for (const auto & candidate : distinct_candidates)
+            if (candidate.accepted && recovery_candidates_.size() < recovery_search_config_.candidate_count)
+                recovery_candidates_.push_back(candidate);
+    if (!decision.proposal) return false;
+    const auto projected = recovery_evaluator_->evaluateFresh(cloud, motion.odom_base,
+        recovery_application_mode_ == "bounded_step" ?
+        RecoveryCoordinator::maskedPose(incumbent, best->map_odom, fusion_config_.update_mask) : decision.map_odom);
+    std::lock_guard<std::mutex> lock(lock_state_);
+    const double final_age = (this->now() - stamp).seconds();
+    if (generation != fusion_generation_ || final_age < 0 || final_age > fusion_max_measurement_age_ ||
+        !projected.accepted)
+    {
+        recovery_coordinator_->rejectedProposal();
+        recovery_status_.message = "projected_pose_rejected_or_stale";
+        return false;
+    }
+    if (decision.shadow)
+    {
+        recovery_status_.message = "would_reset";
+        recovery_coordinator_->invalidate(generation);
+        recovery_candidates_.clear();
+        return false;
+    }
+    const Eigen::Matrix4d old_robot = mat_odom2map_ * motion.odom_base;
+    observation.map_base = decision.map_odom * motion.odom_base;
+    observation.covariance = projected.covariance;
+    const Matrix6d reset_covariance = GlobalCorrectionFilter::regularizeCovariance(
+        RecoveryCoordinator::correctionCovariance(projected.covariance, decision.map_odom, motion.odom_base),
+        fusion_config_.initial_stddev);
+    correction_filter_.reset(decision.map_odom, reset_covariance);
+    mat_odom2map_ = correction_filter_.pose();
+    mat_odom2map_kalman_ = mat_odom2map_;
+    mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+    force_submap_refresh_ = true; fusion_rejection_count_ = 0;
+    ++fusion_generation_; ++recovery_reset_count_;
+    recovery_worker_generation_ = fusion_generation_; recovery_seen_generation_ = fusion_generation_;
+    recovery_coordinator_->applied(fusion_generation_, observation);
+    if (recovery_application_mode_ != "bounded_step") recovery_candidates_.clear();
+    recovery_status_.message = recovery_application_mode_ == "bounded_step" ?
+        "bounded_recovery_step_applied" : "global_reset_applied";
+    recovery_status_.values.push_back(DiagnosticValue("reset_translation",
+        std::to_string((old_robot.block<3, 1>(0, 3) - observation.map_base.block<3, 1>(0, 3)).norm())));
+    recovery_status_.values.push_back(DiagnosticValue("reset_rotation", std::to_string(
+        Eigen::AngleAxisd(observation.map_base.block<3, 3>(0, 0) * old_robot.block<3, 3>(0, 0).transpose()).angle())));
+    geometry_msgs::msg::PoseWithCovarianceStamped reset;
+    reset.header = candidates_message.header;
+    Eigen::Isometry3d reset_pose = Eigen::Isometry3d::Identity(); reset_pose.matrix() = observation.map_base;
+    reset.pose.pose = tf2::toMsg(reset_pose);
+    for (int row = 0; row < 6; ++row)
+        for (int column = 0; column < 6; ++column)
+            reset.pose.covariance[row * 6 + column] = projected.covariance(row, column);
+    pub_recovery_reset_->publish(reset);
+    return true;
+}
+
+void GloabalLocalization::PublishRecoveryHeartbeat()
+{
+    diagnostic_msgs::msg::DiagnosticArray message;
+    message.header.stamp = this->now();
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        auto status = recovery_status_;
+        status.values.insert(status.values.end(), recovery_search_statistics_.begin(),
+            recovery_search_statistics_.end());
+        double scan_age = -1.0;
+        {
+            std::lock_guard<std::mutex> scan_lock(lock_scan_);
+            if (latest_scan_stamp_.nanoseconds() != 0)
+                scan_age = (this->now() - latest_scan_stamp_).seconds();
+        }
+        status.values.push_back(DiagnosticValue("latest_scan_age", std::to_string(scan_age)));
+        if (scan_age < 0.0 || scan_age > fusion_max_measurement_age_)
+        {
+            status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+            status.message = "waiting_for_fresh_scan_window";
+        }
+        if (!fusion_enabled_ || !fusion_config_.recovery.enabled)
+        {
+            status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+            status.message = "recovery_disabled";
+        }
+        message.status.push_back(std::move(status));
+    }
+    pub_fusion_diagnostics_->publish(message);
 }
 
 void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr initialpose)
@@ -1717,6 +2152,7 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
         {
             correction_filter_.reset(corrected_odom_to_map);
             ++fusion_generation_;
+            recovery_worker_generation_ = fusion_generation_;
             {
                 std::lock_guard<std::mutex> timestamp_lock(lock_timestamp_);
                 last_fusion_prediction_stamp_ = timestamp_odom_;
@@ -1746,11 +2182,34 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
 bool GloabalLocalization::LookupMotionSampleLocked(
     const rclcpp::Time & stamp, MotionHistorySample & sample) const
 {
-    for (auto iterator = motion_history_.rbegin(); iterator != motion_history_.rend(); ++iterator)
+    for (std::size_t index = 0; index < motion_history_.size(); ++index)
     {
-        if (iterator->stamp <= stamp)
+        const auto & right = motion_history_[index];
+        if (right.stamp == stamp)
         {
-            sample = *iterator;
+            sample = right;
+            return true;
+        }
+        if (right.stamp > stamp && index > 0)
+        {
+            const auto & left = motion_history_[index - 1];
+            const double gap = (right.stamp - left.stamp).seconds();
+            if (gap <= 0.0 || gap > recovery_max_odometry_gap_)
+                return false;
+            const double alpha = (stamp - left.stamp).seconds() / gap;
+            sample = left;
+            sample.stamp = stamp;
+            sample.odom_base.block<3, 1>(0, 3) =
+                (1.0 - alpha) * left.odom_base.block<3, 1>(0, 3) +
+                alpha * right.odom_base.block<3, 1>(0, 3);
+            sample.odom_base.block<3, 3>(0, 0) =
+                Eigen::Quaterniond(left.odom_base.block<3, 3>(0, 0)).slerp(
+                alpha, Eigen::Quaterniond(right.odom_base.block<3, 3>(0, 0))).toRotationMatrix();
+            sample.covariance = (1.0 - alpha) * left.covariance + alpha * right.covariance;
+            sample.cumulative_distance = (1.0 - alpha) * left.cumulative_distance +
+                alpha * right.cumulative_distance;
+            sample.cumulative_rotation = (1.0 - alpha) * left.cumulative_rotation +
+                alpha * right.cumulative_rotation;
             return true;
         }
     }

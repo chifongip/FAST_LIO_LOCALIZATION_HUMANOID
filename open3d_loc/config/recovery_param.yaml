@@ -1,0 +1,26 @@
+global_localization_node:
+  ros__parameters:
+    # Explicit overlay; loc_param_g1.yaml retains the tuned base policy.
+    fusion:
+      enabled: true
+      recovery:
+        enabled: true
+        # Use shadow in a custom overlay to evaluate without applying resets.
+        application_mode: reset
+        required_consistent_measurements: 3
+        verification_observations: 3
+        search_radius: 6.0
+        vertical_range: 1.0
+        translation_step: 2.0
+        yaw_step_degrees: 30.0
+        search_interval: 10.0
+        failure_trigger: 3
+        search_budget_ms: 500
+        timeout: 20.0
+        max_refined: 16
+        max_candidates: 4
+        score_advantage: 0.15
+        consistency_stddev_translation: 0.15
+        consistency_stddev_rotation: 0.05
+        consistency_mahalanobis_threshold: 16.812
+        observability_ratio: 1.0e-4

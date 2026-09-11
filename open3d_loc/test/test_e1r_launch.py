@@ -29,8 +29,40 @@ def test_global_correction_fusion_matches_current_axis_policy():
     assert fusion["recovery"]["enabled"] is True
     assert fusion["recovery"]["required_consistent_measurements"] == 2
     assert fusion["recovery"]["minimum_candidate_interval"] == 0.75
-    assert "'fusion.enabled': True" in OPEN3D_LAUNCH_FILE.read_text(encoding="utf-8")
-    assert "'fusion.recovery.enabled': True" in OPEN3D_LAUNCH_FILE.read_text(encoding="utf-8")
+    assert fusion["recovery"]["max_odometry_gap"] == 0.15
+    launch_source = OPEN3D_LAUNCH_FILE.read_text(encoding="utf-8")
+    assert "'fusion.enabled':" not in launch_source
+    assert "'fusion.recovery.enabled':" not in launch_source
+
+
+def test_recovery_overlay_is_forwarded_and_loaded_after_base():
+    e1r_source = LAUNCH_FILE.read_text(encoding="utf-8")
+    launch_source = OPEN3D_LAUNCH_FILE.read_text(encoding="utf-8")
+    assert "'recovery_config': LaunchConfiguration('recovery_config')" in e1r_source
+    assert "config_file,\n            LaunchConfiguration('recovery_config')," in launch_source
+    overlay = yaml.safe_load(
+        (CONFIG_FILE.parent / "recovery_param.yaml").read_text(encoding="utf-8")
+    )["global_localization_node"]["ros__parameters"]["fusion"]
+    assert overlay["enabled"] is True
+    recovery = overlay["recovery"]
+    assert recovery["application_mode"] == "reset"
+    assert recovery["required_consistent_measurements"] == 3
+    assert recovery["verification_observations"] == 3
+    assert recovery["search_radius"] == 6.0
+    assert recovery["vertical_range"] == 1.0
+    assert recovery["translation_step"] == 2.0
+    assert recovery["yaw_step_degrees"] == 30.0
+    assert recovery["search_interval"] == 10.0
+    assert recovery["failure_trigger"] == 3
+    assert recovery["search_budget_ms"] == 500.0
+    assert recovery["timeout"] == 20.0
+    assert recovery["max_refined"] == 16
+    assert recovery["max_candidates"] == 4
+    assert recovery["score_advantage"] == 0.15
+    assert recovery["consistency_stddev_translation"] == 0.15
+    assert recovery["consistency_stddev_rotation"] == 0.05
+    assert recovery["consistency_mahalanobis_threshold"] == 16.812
+    assert recovery["observability_ratio"] == 1.0e-4
 
 
 def test_global_localization_uses_one_second_cadence():
