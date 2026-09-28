@@ -196,6 +196,10 @@ if(BUILD_TESTING)
         target_link_libraries(test_global_correction_filter global_correction_filter Eigen3::Eigen)
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
+        ament_add_pytest_test(test_registration_reset test/test_registration_reset.py
+                TIMEOUT 120
+                ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
+        )
 endif()
 
 ament_package()
