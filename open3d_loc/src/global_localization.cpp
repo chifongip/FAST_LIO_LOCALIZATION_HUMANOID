@@ -12,6 +12,9 @@
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_msgs/msg/diagnostic_status.hpp>
+#include <diagnostic_msgs/msg/key_value.hpp>
 
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <queue>
@@ -123,6 +126,7 @@ public:
     void CallbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr initialpose);
 
     void StartLoc();
+    void ReportRegistrationFailure(const std::string & reason);
 
     void Localization();
 
@@ -216,6 +220,8 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom2map_kalman_;
     rclcpp::Time timestamp_odom_;
     std::mutex lock_timestamp_;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_registration_diagnostics_;
+    bool force_submap_refresh_ = false;
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_map_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_scan_;
@@ -316,6 +322,8 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     pub_motionlink2map_ = this->create_publisher<nav_msgs::msg::Odometry>("/motionlink2map", 100000);
     pub_odom2map_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom2map", 100000);
     pub_odom2map_kalman_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom2map_kalman", 100000);
+    pub_registration_diagnostics_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+        "/localization_3d_diagnostics", 10);
 
     pub_map_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "/global_map_3d", rclcpp::QoS(1).reliable().transient_local());
@@ -817,43 +825,55 @@ void GloabalLocalization::LocalizationInitialize()
                 reg_matrix = mat_odom2map_;
             }
 
-            /// 将cropbox转换到对应位置进行裁剪点云
-            OBB_map->center_ = mat_baselink2map_cur.block<3, 1>(0, 3);
-            OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
-            OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
-            OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
-            *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
-
-            /// 配准计时
-            auto reg0_s = std::chrono::high_resolution_clock::now();
-
-            *target = *map_fine_crop;
-            open3d::utility::LogInfo("before sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
-            if (target->points_.size() > static_cast<size_t>(maxpoints_target_))
+            try
             {
-                target = target->RandomDownSample(double(maxpoints_target_) / target->points_.size());
-            }
-            open3d::utility::LogInfo("after sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
+                /// 将cropbox转换到对应位置进行裁剪点云
+                OBB_map->center_ = mat_baselink2map_cur.block<3, 1>(0, 3);
+                OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
+                OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
+                OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
+                *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
 
-            source = pcd_scan->Crop(*OBB_scan);
-            open3d::utility::LogInfo("source size: {}, has normal: {}", source->points_.size(), source->HasNormals() ? "true" : "false");
-            if (source->points_.size() > static_cast<size_t>(maxpoints_source_))
+                /// 配准计时
+                *target = *map_fine_crop;
+                open3d::utility::LogInfo("before sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
+                if (target->points_.size() > static_cast<size_t>(maxpoints_target_))
+                {
+                    target = target->RandomDownSample(double(maxpoints_target_) / target->points_.size());
+                }
+                open3d::utility::LogInfo("after sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
+
+                source = pcd_scan->Crop(*OBB_scan);
+                open3d::utility::LogInfo("source size: {}, has normal: {}", source->points_.size(), source->HasNormals() ? "true" : "false");
+                if (source->points_.size() > static_cast<size_t>(maxpoints_source_))
+                {
+                    source = source->RandomDownSample(double(maxpoints_source_) / source->points_.size());
+                }
+                open3d::utility::LogInfo("source size: {}, has normal: {}", source->points_.size(), source->HasNormals() ? "true" : "false");
+
+                if (source->IsEmpty() || target->IsEmpty())
+                    throw std::runtime_error("empty scan or map crop");
+
+                source->Transform(reg_matrix);
+                *pcd_scan2map = *source;
+
+                // auto multiScale_reg_matrix = pcd_tools::RegistrationMultiScaleIcp(source, target, voxelsize_fine_, 1, {1, 2, 4});
+                auto multiScale_reg_matrix = pcd_tools::RegistrationMultiScaleIcp(source, target, voxelsize_fine_, 1, {1, 2, 3});
+                reg_matrix = multiScale_reg_matrix * reg_matrix;
+                source->Transform(multiScale_reg_matrix);
+                auto eva_result_coarse = open3d::pipelines::registration::EvaluateRegistration(*source, *target, voxelsize_fine_ * 3);
+                open3d::utility::LogInfo("eva fitness: {}", eva_result_coarse.fitness_);
+                fitness_initial = eva_result_coarse.fitness_;
+                *pcd_scan2map = *source;
+
+            }
+            catch (const std::exception & error)
             {
-                source = source->RandomDownSample(double(maxpoints_source_) / source->points_.size());
+                count_success = 0;
+                ReportRegistrationFailure(error.what());
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
             }
-            open3d::utility::LogInfo("source size: {}, has normal: {}", source->points_.size(), source->HasNormals() ? "true" : "false");
-
-            source->Transform(reg_matrix);
-            *pcd_scan2map = *source;
-
-            // auto multiScale_reg_matrix = pcd_tools::RegistrationMultiScaleIcp(source, target, voxelsize_fine_, 1, {1, 2, 4});
-            auto multiScale_reg_matrix = pcd_tools::RegistrationMultiScaleIcp(source, target, voxelsize_fine_, 1, {1, 2, 3});
-            reg_matrix = multiScale_reg_matrix * reg_matrix;
-            source->Transform(multiScale_reg_matrix);
-            auto eva_result_coarse = open3d::pipelines::registration::EvaluateRegistration(*source, *target, voxelsize_fine_ * 3);
-            open3d::utility::LogInfo("eva fitness: {}", eva_result_coarse.fitness_);
-            fitness_initial = eva_result_coarse.fitness_;
-            *pcd_scan2map = *source;
 
             auto loc_e = std::chrono::high_resolution_clock::now(); /// 结束定位计时
             loc_cost = std::chrono::duration_cast<std::chrono::microseconds>(loc_e - loc_s).count() / 1000.0;
@@ -1046,6 +1066,7 @@ void GloabalLocalization::Localization()
             *pcd_scan = *pcd_scan_cur_;
             lock_scan_.unlock();
 
+            bool force_submap_refresh = false;
             Eigen::Matrix4d reg_matrix = Eigen::Matrix4d::Identity();
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
@@ -1059,54 +1080,70 @@ void GloabalLocalization::Localization()
                 mat_baselink2odom_cur = mat_baselink2odom_;
                 mat_baselink2map_cur = mat_baselink2map_;
                 reg_matrix = mat_odom2map_;
+                force_submap_refresh = force_submap_refresh_;
+                force_submap_refresh_ = false;
             }
-            Eigen::Vector3d cur_loc(mat_baselink2map_cur(0, 3), mat_baselink2map_cur(1, 3), mat_baselink2map_cur(2, 3));
-            auto dis_motion = ComputeMotionDis(last_loc_, cur_loc);
-            if (dis_motion > dis_updatemap_)
+            open3d::pipelines::registration::RegistrationResult reg_result2;
+            open3d::pipelines::registration::RegistrationResult eva_result2;
+            try
             {
-                auto submap_s = std::chrono::high_resolution_clock::now();
+                Eigen::Vector3d cur_loc(mat_baselink2map_cur(0, 3), mat_baselink2map_cur(1, 3), mat_baselink2map_cur(2, 3));
+                auto dis_motion = ComputeMotionDis(last_loc_, cur_loc);
+                if (force_submap_refresh || dis_motion > dis_updatemap_)
+                {
+                    auto submap_s = std::chrono::high_resolution_clock::now();
 
-                open3d::utility::LogInfo("\n***\n****\n***\n\n\nlast map update loc: x: {}, y: {}, z{},\n\
-                now loc: x: {}, y: {}, z{}, 3d distance: {}, now needpdate submap",
-                                         last_loc_.x(), last_loc_.y(), last_loc_.z(), cur_loc.x(), cur_loc.y(), cur_loc.z(), dis_motion);
-                last_loc_ = cur_loc;
-                OBB_map->center_ = mat_baselink2map_cur.block<3, 1>(0, 3);
-                OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
+                    open3d::utility::LogInfo("\n***\n****\n***\n\n\nlast map update loc: x: {}, y: {}, z{},\n\
+                    now loc: x: {}, y: {}, z{}, 3d distance: {}, now needpdate submap",
+                                             last_loc_.x(), last_loc_.y(), last_loc_.z(), cur_loc.x(), cur_loc.y(), cur_loc.z(), dis_motion);
+                    last_loc_ = cur_loc;
+                    OBB_map->center_ = mat_baselink2map_cur.block<3, 1>(0, 3);
+                    OBB_map->R_ = mat_baselink2map_cur.block<3, 3>(0, 0);
 
-                /// 粗地图和精地图
-                *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
+                    /// 粗地图和精地图
+                    *map_fine_crop = *pcd_map_fine_->Crop(*OBB_map);
 
-                auto submap_e = std::chrono::high_resolution_clock::now();
-                auto submap_cost = std::chrono::duration_cast<std::chrono::microseconds>(submap_e - submap_s).count() / 1000.0;
-                RCLCPP_INFO(this->get_logger(), "submap_cost: %f ms", submap_cost);
+                    auto submap_e = std::chrono::high_resolution_clock::now();
+                    auto submap_cost = std::chrono::duration_cast<std::chrono::microseconds>(submap_e - submap_s).count() / 1000.0;
+                    RCLCPP_INFO(this->get_logger(), "submap_cost: %f ms", submap_cost);
+                }
+
+                OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
+                OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
+
+                *target = *map_fine_crop;
+                open3d::utility::LogInfo("before sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
+                if (target->points_.size() > static_cast<size_t>(maxpoints_target_))
+                {
+                    target = target->RandomDownSample(double(maxpoints_target_) / target->points_.size());
+                }
+                open3d::utility::LogInfo("after sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
+
+                source = pcd_scan->Crop(*OBB_scan);
+                open3d::utility::LogInfo("source size: {}, maxpoints_source_: {}", source->points_.size(), maxpoints_source_);
+                source = source->VoxelDownSample(voxelsize_fine_);
+                open3d::utility::LogInfo("source size after voxel downsample: {}", source->points_.size());
+                if (source->points_.size() > static_cast<size_t>(maxpoints_source_))
+                {
+                    source = source->RandomDownSample(double(maxpoints_source_) / source->points_.size());
+                }
+                open3d::utility::LogInfo("after prerpocess: {}", source->points_.size());
+
+                if (source->IsEmpty() || target->IsEmpty())
+                    throw std::runtime_error("empty scan or map crop");
+                if (!target->HasNormals())
+                    throw std::runtime_error("map crop has no normals");
+
+                reg_result2 = pcd_tools::RegistrationIcp(source, target, voxelsize_fine_ * 2, reg_matrix, 1);
+                reg_matrix = reg_result2.transformation_ * reg_matrix;
+                eva_result2 = open3d::pipelines::registration::EvaluateRegistration(*source, *target, voxelsize_fine_ * 4, reg_matrix);
             }
-
-            OBB_scan->center_ = mat_baselink2odom_cur.block<3, 1>(0, 3);
-            OBB_scan->R_ = mat_baselink2odom_cur.block<3, 3>(0, 0);
-
-            auto reg0_s = std::chrono::high_resolution_clock::now();
-
-            *target = *map_fine_crop;
-            open3d::utility::LogInfo("before sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
-            if (target->points_.size() > static_cast<size_t>(maxpoints_target_))
+            catch (const std::exception & error)
             {
-                target = target->RandomDownSample(double(maxpoints_target_) / target->points_.size());
+                ReportRegistrationFailure(error.what());
+                loc_cost = 0.0;
+                continue;
             }
-            open3d::utility::LogInfo("after sample, target size: {}, has normal: {}", target->points_.size(), target->HasNormals() ? "true" : "false");
-
-            source = pcd_scan->Crop(*OBB_scan);
-            open3d::utility::LogInfo("source size: {}, maxpoints_source_: {}", source->points_.size(), maxpoints_source_);
-            source = source->VoxelDownSample(voxelsize_fine_);
-            open3d::utility::LogInfo("source size after voxel downsample: {}", source->points_.size());
-            if (source->points_.size() > static_cast<size_t>(maxpoints_source_))
-            {
-                source = source->RandomDownSample(double(maxpoints_source_) / source->points_.size());
-            }
-            open3d::utility::LogInfo("after prerpocess: {}", source->points_.size());
-
-            auto reg_result2 = pcd_tools::RegistrationIcp(source, target, voxelsize_fine_ * 2, reg_matrix, 1);
-            reg_matrix = reg_result2.transformation_ * reg_matrix;
-            auto eva_result2 = open3d::pipelines::registration::EvaluateRegistration(*source, *target, voxelsize_fine_ * 4, reg_matrix);
             /// 给发布的置信度赋值
             const double localization_fitness = eva_result2.fitness_;
             open3d::utility::LogInfo("reg_result.fitness: {}, eva fitness: {}", reg_result2.fitness_, eva_result2.fitness_);
@@ -1137,6 +1174,29 @@ void GloabalLocalization::Localization()
             RCLCPP_INFO(this->get_logger(), "localization cost: %f ms", loc_cost);
         }
     }
+}
+
+void GloabalLocalization::ReportRegistrationFailure(const std::string & reason)
+{
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        loc_fitness_ = 0.0;
+    }
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "Skipping localization registration: %s. Manual reset via /initialpose remains available.",
+        reason.c_str());
+    diagnostic_msgs::msg::DiagnosticArray diagnostics;
+    diagnostics.header.stamp = this->now();
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "localization_registration";
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    status.message = "Registration unavailable; manual localization reset remains available";
+    diagnostic_msgs::msg::KeyValue failure_reason;
+    failure_reason.key = "reason";
+    failure_reason.value = reason;
+    status.values.push_back(std::move(failure_reason));
+    diagnostics.status.push_back(std::move(status));
+    pub_registration_diagnostics_->publish(diagnostics);
 }
 
 void GloabalLocalization::StartLoc()
@@ -1185,6 +1245,7 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
         mat_odom2map_ = corrected_odom_to_map;
         mat_odom2map_kalman_ = corrected_odom_to_map;
         mat_baselink2map_ = desired_body_to_map;
+        force_submap_refresh_ = true;
 
         if (kf_param_x_.size() >= 2 && kf_param_y_.size() >= 2 && kf_param_z_.size() >= 2)
         {

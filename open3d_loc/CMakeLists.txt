@@ -20,6 +20,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -133,6 +134,7 @@ ament_target_dependencies(global_localization_node
         std_msgs
         geometry_msgs
         nav_msgs
+        diagnostic_msgs
         sensor_msgs
         tf2
         tf2_ros
@@ -183,6 +185,10 @@ if(BUILD_TESTING)
         target_link_libraries(test_transform_utils Eigen3::Eigen)
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
+        ament_add_pytest_test(test_registration_reset test/test_registration_reset.py
+                TIMEOUT 120
+                ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
+        )
 endif()
 
 ament_package()
