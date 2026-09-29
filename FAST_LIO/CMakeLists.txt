@@ -125,6 +125,10 @@ ament_target_dependencies(fastlio_mapping ${dependencies})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_scan_update test/test_scan_update.cpp)
+  target_include_directories(test_scan_update PRIVATE src include ${PCL_INCLUDE_DIRS})
+  target_link_libraries(test_scan_update ${PCL_LIBRARIES} Eigen3::Eigen ${cpp_typesupport_target})
+  ament_target_dependencies(test_scan_update ${dependencies})
   ament_add_gtest(test_e1r_preprocess
     test/test_e1r_preprocess.cpp
     src/preprocess.cpp

@@ -194,6 +194,22 @@ The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file wi
     <img src="doc/uav_system.png" width=57% >
 </div>
 
+## Rejected sensor updates
+
+After initialization, each scan is accepted only when IMU processing and the
+LiDAR filter update both succeed. Missing or invalid sensor data, excessive IMU
+gaps, insufficient points, incomplete corrections, and nonfinite estimates
+retain the preceding filter state, covariance, accepted cloud, and local map.
+Rejected scans do not publish new odometry, TF, registered clouds, or path points.
+An invalid filter iteration can still recover in a later iteration of that scan.
+
+`mapping.max_imu_gap_sec` defaults to `0.2` seconds and must be finite and positive.
+Rejected sensor intervals are consumed without integrating them again into the
+retained state. Processing resumes when a later scan succeeds. Motion during a
+discarded interval is not estimated; if matching cannot resume, restart FAST-LIO
+and reset global localization. Retained poses and clouds are not republished with
+fresh timestamps. Existing sensor calibration and tuning are unchanged.
+
 ## 6.Acknowledgments
 
 Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).

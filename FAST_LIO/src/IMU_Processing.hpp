@@ -1,4 +1,8 @@
 #include <cmath>
+#include <stdexcept>
+#include <string>
+#include <algorithm>
+#include <rclcpp/time.hpp>
 #include <math.h>
 #include <deque>
 #include <mutex>
@@ -49,7 +53,15 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   bool last_gyro_measurement(V3D &measurement) const;
   Eigen::Matrix<double, 12, 12> Q;
-  void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  enum class ProcessStatus {Initializing, Ready, Rejected};
+  struct ProcessResult
+  {
+    ProcessStatus status;
+    std::string reason;
+  };
+  double max_imu_gap_sec = 0.2;
+  void Skip(const MeasureGroup &meas, const state_ikfom &state);
+  ProcessResult Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -76,9 +88,9 @@ class ImuProcess
   V3D mean_gyr;
   V3D gyro_measurement_last;
   V3D angvel_last;
-  V3D acc_s_last;
+  V3D acc_s_last = Zero3d;
   double start_timestamp_;
-  double last_lidar_end_time_;
+  double last_lidar_end_time_ = -1.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -302,7 +314,12 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+    if (dt < 0.0 || dt > max_imu_gap_sec)
+      throw std::runtime_error("invalid IMU integration interval");
+    if (dt == 0.0) continue;
     kf_state.predict(dt, Q, in);
+    if (!kf_state.get_P().allFinite())
+      throw std::runtime_error("nonfinite IMU covariance");
 
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
@@ -319,6 +336,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  if (!std::isfinite(dt) || dt > max_imu_gap_sec)
+    throw std::runtime_error("invalid scan-end integration interval");
   kf_state.predict(dt, Q, in);
   
   imu_state = kf_state.get_x();
@@ -363,13 +382,44 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   }
 }
 
-void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr cur_pcl_un_)
+ImuProcess::ProcessResult ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr cur_pcl_un_)
 {
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
-  if(meas.imu.empty()) {return;};
-  assert(meas.lidar != nullptr);
+  cur_pcl_un_->clear();
+  if (!meas.lidar || meas.lidar->empty() || meas.imu.empty())
+    return {ProcessStatus::Rejected, "missing LiDAR or IMU input"};
+  for (const auto &point : meas.lidar->points)
+  {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+        !std::isfinite(point.curvature) || point.curvature < 0.0)
+      return {ProcessStatus::Rejected, "invalid LiDAR point"};
+  }
+  if (!std::isfinite(meas.lidar_beg_time) || !std::isfinite(meas.lidar_end_time) ||
+      meas.lidar_beg_time < 0.0 || meas.lidar_end_time < meas.lidar_beg_time ||
+      (!imu_need_init_ && meas.lidar_end_time <= last_lidar_end_time_))
+    return {ProcessStatus::Rejected, "invalid scan timestamp"};
+  double previous = imu_need_init_ ? -1.0 : last_lidar_end_time_;
+  double ordered_stamp = -1.0;
+  for (const auto &imu : meas.imu)
+  {
+    const double stamp = rclcpp::Time(imu->header.stamp).seconds();
+    const auto &acc = imu->linear_acceleration;
+    const auto &gyro = imu->angular_velocity;
+    if (!std::isfinite(acc.x) || !std::isfinite(acc.y) || !std::isfinite(acc.z) ||
+        !std::isfinite(gyro.x) || !std::isfinite(gyro.y) || !std::isfinite(gyro.z) ||
+        stamp < 0.0 || stamp < ordered_stamp || stamp > meas.lidar_end_time)
+      return {ProcessStatus::Rejected, "invalid IMU sample"};
+    if (imu_need_init_ && V3D(acc.x, acc.y, acc.z).norm() < 1e-6)
+      return {ProcessStatus::Rejected, "missing initialization acceleration"};
+    ordered_stamp = stamp;
+    if (previous >= 0.0 && stamp - previous > max_imu_gap_sec)
+      return {ProcessStatus::Rejected, "IMU sample gap"};
+    previous = std::max(previous, stamp);
+  }
+  if (meas.lidar_end_time - previous > max_imu_gap_sec)
+    return {ProcessStatus::Rejected, "missing IMU coverage"};
 
   if (imu_need_init_)
   {
@@ -391,16 +441,56 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
       std::cout << "IMU Initial Done" << std::endl;
       // ROS_INFO("IMU Initial Done: Gravity: %.4f %.4f %.4f %.4f; state.bias_g: %.4f %.4f %.4f; acc covarience: %.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f",\
       //          imu_state.grav[0], imu_state.grav[1], imu_state.grav[2], mean_acc.norm(), cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2], cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1], cov_gyr[2]);
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
+      if (!fout_imu.is_open())
+        fout_imu.open(DEBUG_FILE_DIR("imu.txt"),ios::out);
     }
 
-    return;
+    last_lidar_end_time_ = meas.lidar_end_time;
+    return {ProcessStatus::Initializing, ""};
   }
 
-  UndistortPcl(meas, kf_state, *cur_pcl_un_);
+  if (!mean_acc.allFinite() || mean_acc.norm() < 1e-6)
+    return {ProcessStatus::Rejected, "invalid IMU acceleration scale"};
+  try
+  {
+    UndistortPcl(meas, kf_state, *cur_pcl_un_);
+  }
+  catch (const std::runtime_error &error)
+  {
+    cur_pcl_un_->clear();
+    return {ProcessStatus::Rejected, error.what()};
+  }
+  if (cur_pcl_un_->empty())
+    return {ProcessStatus::Rejected, "empty deskewed cloud"};
 
   t2 = omp_get_wtime();
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
+  return {ProcessStatus::Ready, ""};
+}
+
+void ImuProcess::Skip(const MeasureGroup &meas, const state_ikfom &state)
+{
+  if (!std::isfinite(meas.lidar_end_time) || meas.lidar_end_time < 0.0 ||
+      meas.lidar_end_time < last_lidar_end_time_)
+    return;
+  // Drop the rejected interval without replaying it into the retained estimate.
+  auto boundary_imu = std::make_shared<sensor_msgs::msg::Imu>(*last_imu_);
+  boundary_imu->header.stamp = rclcpp::Time(
+      static_cast<int64_t>(meas.lidar_end_time * 1e9));
+  boundary_imu->angular_velocity.x = state.bg.x();
+  boundary_imu->angular_velocity.y = state.bg.y();
+  boundary_imu->angular_velocity.z = state.bg.z();
+  const V3D acceleration = -(state.rot.inverse() * state.grav.vec);
+  const V3D raw_acceleration = (acceleration + state.ba) * mean_acc.norm() / G_m_s2;
+  boundary_imu->linear_acceleration.x = raw_acceleration.x();
+  boundary_imu->linear_acceleration.y = raw_acceleration.y();
+  boundary_imu->linear_acceleration.z = raw_acceleration.z();
+  last_imu_ = boundary_imu;
+  last_lidar_end_time_ = meas.lidar_end_time;
+  acc_s_last.setZero();
+  angvel_last.setZero();
+  has_last_gyro_measurement_ = false;
+  IMUpose.clear();
 }

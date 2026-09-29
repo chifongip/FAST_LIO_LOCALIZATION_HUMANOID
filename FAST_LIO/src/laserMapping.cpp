@@ -445,8 +445,10 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
+        mtx_buffer.unlock();
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                            "Dropping backward IMU timestamp");
+        return;
     }
 
     last_timestamp_imu = timestamp;
@@ -920,7 +922,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        std::cerr << "No Effective Points!" << std::endl;
+        // Report rejection once per scan, after all filter iterations finish.
         // ROS_WARN("No Effective Points! \n");
         return;
     }
@@ -995,6 +997,7 @@ public:
         this->declare_parameter<double>("mapping.fov_degree", 180.);
         this->declare_parameter<double>("mapping.gyr_cov", 0.1);
         this->declare_parameter<double>("mapping.acc_cov", 0.1);
+        this->declare_parameter<double>("mapping.max_imu_gap_sec", 0.2);
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("preprocess.blind", 0.01);
@@ -1093,6 +1096,9 @@ public:
 
         Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
+        p_imu->max_imu_gap_sec = this->get_parameter("mapping.max_imu_gap_sec").as_double();
+        if (!std::isfinite(p_imu->max_imu_gap_sec) || p_imu->max_imu_gap_sec <= 0.0)
+            throw std::invalid_argument("mapping.max_imu_gap_sec must be finite and positive");
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -1176,19 +1182,47 @@ private:
             svd_time = 0;
             t0 = omp_get_wtime();
 
-            p_imu->Process(Measures, kf, feats_undistort);
+            auto retained_state = kf.get_x();
+            auto retained_covariance = kf.get_P();
+            auto retained_cloud = feats_undistort;
+            feats_undistort.reset(new PointCloudXYZI());
+            auto reject_scan = [&](const std::string &reason) {
+                kf.change_x(retained_state);
+                kf.change_P(retained_covariance);
+                feats_undistort = retained_cloud;
+                state_point = retained_state;
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                p_imu->Skip(Measures, retained_state);
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Rejected scan (%s); retaining accepted state and map", reason.c_str());
+            };
+            auto finite_state = [&]() {
+                const auto &state = kf.get_x();
+                return state.pos.allFinite() && state.vel.allFinite() &&
+                    state.bg.allFinite() && state.ba.allFinite() && state.grav.vec.allFinite() &&
+                    state.rot.toRotationMatrix().allFinite() &&
+                    state.offset_R_L_I.toRotationMatrix().allFinite() &&
+                    state.offset_T_L_I.allFinite() && kf.get_P().allFinite();
+            };
+            const auto imu_result = p_imu->Process(Measures, kf, feats_undistort);
+            if (imu_result.status == ImuProcess::ProcessStatus::Initializing)
+                return;
+            if (imu_result.status == ImuProcess::ProcessStatus::Rejected || !finite_state())
+            {
+                reject_scan(imu_result.reason.empty() ? "nonfinite IMU prediction" : imu_result.reason);
+                return;
+            }
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            if (feats_undistort->empty())
             {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                reject_scan("empty deskewed cloud");
                 return;
             }
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1201,6 +1235,7 @@ private:
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if (feats_down_size > 5)
                 {
+                    lasermap_fov_segment();
                     ikdtree.set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
                     for (int i = 0; i < feats_down_size; i++)
@@ -1209,6 +1244,8 @@ private:
                     }
                     ikdtree.Build(feats_down_world->points);
                 }
+                else
+                    reject_scan("insufficient points to seed local map");
                 return;
             }
             int featsFromMapNum = ikdtree.validnum();
@@ -1219,7 +1256,7 @@ private:
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
-                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                reject_scan("insufficient downsampled points");
                 return;
             }
 
@@ -1248,7 +1285,25 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
-            kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            if (!kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time) ||
+                !finite_state())
+            {
+                reject_scan("LiDAR correction did not complete a finite update");
+                return;
+            }
+            for (const auto &point : feats_undistort->points)
+            {
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+                {
+                    reject_scan("nonfinite deskewed point");
+                    return;
+                }
+            }
+            if (!Measures.gyro_at_lidar_end_valid)
+            {
+                reject_scan("missing scan-end IMU angular velocity");
+                return;
+            }
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -1264,6 +1319,7 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
+            lasermap_fov_segment();
             map_incremental();
             t5 = omp_get_wtime();
 
