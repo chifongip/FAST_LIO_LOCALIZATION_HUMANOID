@@ -100,6 +100,8 @@ public:
     double cumulative_distance,
     double cumulative_rotation);
   void clearRecovery();
+  // Deterministic projection; preserve covariance and recovery history.
+  void adjustHeight(double delta_z);
 
   bool initialized() const;
   const Eigen::Matrix4d & pose() const;

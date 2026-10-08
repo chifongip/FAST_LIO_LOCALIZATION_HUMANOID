@@ -15,6 +15,7 @@ set(CMAKE_BUILD_TYPE "Release")
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -135,6 +136,7 @@ target_link_libraries(global_localization_node
 )
 ament_target_dependencies(global_localization_node
         rclcpp
+        rcl_interfaces
         std_msgs
         geometry_msgs
         nav_msgs
@@ -196,6 +198,10 @@ if(BUILD_TESTING)
         target_link_libraries(test_global_correction_filter global_correction_filter Eigen3::Eigen)
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
+        ament_add_pytest_test(test_height_bounds test/test_height_bounds.py
+                TIMEOUT 120
+                ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
+        )
         ament_add_pytest_test(test_registration_reset test/test_registration_reset.py
                 TIMEOUT 120
                 ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>

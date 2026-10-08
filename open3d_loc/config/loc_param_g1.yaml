@@ -8,10 +8,18 @@ global_localization_node:
       y: [0.001, 0.005]
       z: [0.00001, 0.04]
 
+    # Map-frame base_link height above the configured flat floor (metres).
+    height_bounds:
+      enabled: true
+      floor_z: 0.0
+      min_height: 0.3
+      max_height: 0.7
+
     # Error-state filter for the map -> odom correction.
     # Axis order is [x, y, z, roll, pitch, yaw].
     fusion:
       enabled: true
+      # Correct all six axes; height_bounds projects the resulting body height.
       update_mask: [true, true, true, true, true, true]
       initial_stddev: [0.25, 0.25, 0.15, 0.05, 0.05, 0.15]
       process_stddev_time: [0.02, 0.02, 0.01, 0.005, 0.005, 0.01]

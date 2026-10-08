@@ -15,6 +15,7 @@
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <deque>
@@ -38,6 +39,7 @@
 #include "open3d_conversions/open3d_conversions.h"
 #include "open3d_loc/transform_utils.hpp"
 #include "open3d_loc/global_correction_filter.hpp"
+#include "open3d_loc/height_bounds.hpp"
 
 #define PI 3.1415926
 
@@ -311,6 +313,42 @@ private:
     bool publish_output_tf_ = true;
     double tf_lookup_max_age_ms_ = 100.0;
     bool have_odom_ = false;
+    open3d_loc::HeightBounds height_bounds_;
+    double height_before_bounds_ = 0.0;
+    double bounded_height_ = 0.0;
+    double height_adjustment_ = 0.0;
+    std::uint64_t height_clamp_count_ = 0;
+
+    // Caller holds lock_state_. Keep filter state and all derived poses consistent.
+    void ApplyHeightBoundsLocked()
+    {
+        if (!have_odom_) return;
+        height_before_bounds_ = (mat_odom2map_ * mat_baselink2odom_)(2, 3) - height_bounds_.floor_z;
+        height_adjustment_ = height_bounds_.adjustment(mat_odom2map_, mat_baselink2odom_);
+        if (height_adjustment_ != 0.0)
+        {
+            mat_odom2map_(2, 3) += height_adjustment_;
+            if (correction_filter_.initialized())
+                correction_filter_.adjustHeight(mat_odom2map_(2, 3) - correction_filter_.pose()(2, 3));
+            ++height_clamp_count_;
+            force_submap_refresh_ = true;
+        }
+        bounded_height_ = (mat_odom2map_ * mat_baselink2odom_)(2, 3) - height_bounds_.floor_z;
+        mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+    }
+
+    void AppendHeightDiagnosticsLocked(diagnostic_msgs::msg::DiagnosticStatus & status) const
+    {
+        status.values.push_back(DiagnosticValue("height_bounds_enabled", height_bounds_.enabled ? "true" : "false"));
+        status.values.push_back(DiagnosticValue("height_floor_z", std::to_string(height_bounds_.floor_z)));
+        status.values.push_back(DiagnosticValue("height_min", std::to_string(height_bounds_.min_height)));
+        status.values.push_back(DiagnosticValue("height_max", std::to_string(height_bounds_.max_height)));
+        status.values.push_back(DiagnosticValue("height_before_bounds", std::to_string(height_before_bounds_)));
+        status.values.push_back(DiagnosticValue("height_published", std::to_string(bounded_height_)));
+        status.values.push_back(DiagnosticValue("height_adjustment", std::to_string(height_adjustment_)));
+        status.values.push_back(DiagnosticValue("height_clamp_count", std::to_string(height_clamp_count_)));
+    }
+
 
     /// @brief 初始位姿, x, y, z, roll, pitch, yaw (单位:度degrees)
     std::vector<double> initialpose_;
@@ -660,6 +698,18 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
         ToVector6(fusion_process_stddev_rotation, fusion_config_.process_stddev_rotation);
     fusion_config_.measurement_stddev_floor =
         ToVector6(fusion_measurement_stddev_floor, fusion_config_.measurement_stddev_floor);
+    rcl_interfaces::msg::ParameterDescriptor height_descriptor;
+    height_descriptor.read_only = true;
+    height_descriptor.description = "Startup-only height constraint; restart to change";
+    height_bounds_.enabled = declare_parameter<bool>(
+        "height_bounds.enabled", false, height_descriptor);
+    height_bounds_.floor_z = declare_parameter<double>(
+        "height_bounds.floor_z", 0.0, height_descriptor);
+    height_bounds_.min_height = declare_parameter<double>(
+        "height_bounds.min_height", 0.3, height_descriptor);
+    height_bounds_.max_height = declare_parameter<double>(
+        "height_bounds.max_height", 0.7, height_descriptor);
+    height_bounds_.validate(fusion_enabled_);
     correction_filter_.configure(fusion_config_);
     if (fusion_enabled_ && filter_odom2map_)
         RCLCPP_WARN(this->get_logger(), "fusion.enabled overrides the legacy filter_odom2map path");
@@ -836,6 +886,11 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
     const Eigen::Matrix4d mat_body_to_odom =
         open3d_loc::deriveBodyPose(mat_imu_to_odom, mat_body_to_imu);
 
+    if (!mat_body_to_odom.allFinite())
+    {
+        RCLCPP_WARN(this->get_logger(), "Ignoring nonfinite body odometry");
+        return;
+    }
     Eigen::Matrix4d mat_odom_to_map = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d mat_body_to_map = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d mat_body_to_map_filtered = Eigen::Matrix4d::Identity();
@@ -903,13 +958,26 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         mat_imulink2baselink_ = mat_body_to_imu;
         mat_baselink2motionlink_ = mat_body_to_output;
         mat_baselink2odom_ = mat_body_to_odom;
-        mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
         have_odom_ = true;
+        ApplyHeightBoundsLocked();
 
         mat_odom_to_map = mat_odom2map_;
         mat_body_to_map = mat_baselink2map_;
         mat_odom_to_map_kalman = mat_odom2map_kalman_;
         mat_body_to_map_filtered = mat_body_to_map;
+        if (height_bounds_.enabled)
+        {
+            diagnostic_msgs::msg::DiagnosticArray diagnostics;
+            diagnostics.header.stamp = baselink2odom->header.stamp;
+            diagnostic_msgs::msg::DiagnosticStatus status;
+            status.name = "open3d_loc/height_bounds";
+            status.hardware_id = "open3d_loc";
+            status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+            status.message = height_adjustment_ == 0.0 ? "Height within bounds" : "Height bounded";
+            AppendHeightDiagnosticsLocked(status);
+            diagnostics.status.push_back(std::move(status));
+            pub_fusion_diagnostics_->publish(diagnostics);
+        }
         localization_initialized = loc_initialized_;
         localization_fitness = loc_fitness_;
         if (fusion_enabled_ && correction_filter_.initialized())
@@ -1195,7 +1263,7 @@ void GloabalLocalization::LocalizationInitialize()
                 {
                     std::lock_guard<std::mutex> lock(lock_state_);
                     mat_odom2map_ = reg_matrix;
-                    mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+                    ApplyHeightBoundsLocked();
                 }
                 count_success += 1;
                 /// 连续两次定位成功后定位初始化成功
@@ -1252,7 +1320,7 @@ void GloabalLocalization::Localization()
     {
         std::lock_guard<std::mutex> lock(lock_state_);
         mat_odom2map_ = mat_initialpose_;
-        mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+        ApplyHeightBoundsLocked();
     }
     LocalizationInitialize();
 
@@ -1529,7 +1597,7 @@ void GloabalLocalization::Localization()
                         if (update_result.accepted)
                         {
                             mat_odom2map_ = correction_filter_.pose();
-                            mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+                            ApplyHeightBoundsLocked();
                             fusion_rejection_count_ = 0;
                             correction_accepted = true;
                             diagnostic_reason = update_result.reason;
@@ -1557,7 +1625,7 @@ void GloabalLocalization::Localization()
                                     if (recovery_result.correction_applied)
                                     {
                                         mat_odom2map_ = correction_filter_.pose();
-                                        mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+                                        ApplyHeightBoundsLocked();
                                         force_submap_refresh_ = true;
                                         fusion_rejection_count_ = 0;
                                         recovery_applied = true;
@@ -1589,7 +1657,7 @@ void GloabalLocalization::Localization()
                 else if (localization_fitness > threshold_fitness_)
                 {
                     mat_odom2map_ = reg_matrix;
-                    mat_baselink2map_ = mat_odom2map_ * mat_baselink2odom_;
+                    ApplyHeightBoundsLocked();
                 }
 
                 if (fusion_enabled_)
@@ -1666,6 +1734,7 @@ void GloabalLocalization::Localization()
                     status.values.push_back(DiagnosticValue(
                         "localization_overrun_count",
                         std::to_string(localization_overrun_count_)));
+                    AppendHeightDiagnosticsLocked(status);
                     diagnostics.status.push_back(std::move(status));
                     pub_fusion_diagnostics_->publish(diagnostics);
                 }
@@ -1718,6 +1787,10 @@ void GloabalLocalization::ReportRegistrationFailure(const std::string & reason)
     status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     status.message = "Registration unavailable; manual localization reset remains available";
     status.values.push_back(DiagnosticValue("reason", reason));
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        AppendHeightDiagnosticsLocked(status);
+    }
     diagnostics.status.push_back(std::move(status));
     pub_fusion_diagnostics_->publish(diagnostics);
 }
@@ -1763,6 +1836,12 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
             open3d_loc::levelOrientationFromYaw(clicked_yaw);
 
         // RViz provides T_map_base. FAST-LIO provides T_odom_base, so solve for T_map_odom.
+        if (height_bounds_.enabled)
+        {
+            const double height = desired_body_to_map(2, 3) - height_bounds_.floor_z;
+            desired_body_to_map(2, 3) = height_bounds_.floor_z +
+                std::clamp(height, height_bounds_.min_height, height_bounds_.max_height);
+        }
         corrected_odom_to_map = desired_body_to_map * mat_baselink2odom_.inverse();
         mat_initialpose_ = corrected_odom_to_map;
         mat_odom2map_ = corrected_odom_to_map;

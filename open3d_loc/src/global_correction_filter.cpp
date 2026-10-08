@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <stdexcept>
 
 namespace open3d_loc
 {
@@ -359,6 +360,14 @@ void GlobalCorrectionFilter::clearRecovery()
 bool GlobalCorrectionFilter::initialized() const
 {
   return initialized_;
+}
+
+void GlobalCorrectionFilter::adjustHeight(double delta_z)
+{
+  if (!initialized_ || !std::isfinite(delta_z)) {
+    throw std::invalid_argument("Height projection requires an initialized filter and finite delta");
+  }
+  pose_(2, 3) += delta_z;
 }
 
 const Eigen::Matrix4d & GlobalCorrectionFilter::pose() const

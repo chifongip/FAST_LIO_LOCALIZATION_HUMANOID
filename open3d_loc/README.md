@@ -76,7 +76,7 @@ replacing the correction directly.
 | Parameter | Current value | Meaning and tuning effect |
 | --- | --- | --- |
 | `fusion.enabled` | `true` | Enables the error-state global-correction filter and recovery logic. |
-| `fusion.update_mask` | `[true, true, true, true, true, true]` | Axes ICP is allowed to correct. The current configuration corrects all six axes. For a gravity-aligned map with reliable IMU attitude, `[true, true, true, false, false, true]` is often safer because it keeps roll/pitch with FAST-LIO. |
+| `fusion.update_mask` | `[true, true, true, true, true, true]` | Axes ICP is allowed to correct. The current configuration corrects all six axes. Height bounds project the resulting map-frame body height after each correction; roll and pitch remain as estimated by fusion. |
 | `fusion.initial_stddev` | `[0.25, 0.25, 0.15, 0.05, 0.05, 0.15]` | Initial correction uncertainty. Larger values let the first valid ICP measurement move the filter more; smaller values make startup more conservative. |
 | `fusion.process_stddev_time` | `[0.02, 0.02, 0.01, 0.005, 0.005, 0.01]` | Uncertainty growth per second. Increase an axis when its global correction legitimately changes over time; decrease it to resist jitter. |
 | `fusion.process_stddev_distance` | `[0.01, 0.01, 0.005, 0.002, 0.002, 0.005]` | Additional uncertainty growth per metre of FAST-LIO motion. It also makes recovery confirmation more tolerant while the robot moves. |
@@ -90,6 +90,47 @@ replacing the correction directly.
 | `fusion.max_innovation_translation` | `1.0` | Maximum normal-filter translation innovation. Larger errors are routed to recovery, not accepted normally. Keep this conservative. |
 | `fusion.max_innovation_rotation` | `0.35` | Maximum normal-filter rotation innovation (~20 degrees). Larger errors are routed to recovery when ICP quality is valid. |
 | `fusion.mahalanobis_threshold` | `13.277` | Statistical normal-update gate. Increase only if the filter covariance/noise model is demonstrably too confident; otherwise it prevents overconfident ICP jumps. |
+
+## Flat-floor height bounds
+
+The current flat-environment YAML enables `height_bounds`. Code defaults keep
+it disabled for compatibility with other launches. All values are startup-only;
+restart localization after editing them. ROS parameter services reject changes
+to these read-only parameters while the node is running.
+
+```yaml
+height_bounds:
+  enabled: true
+  floor_z: 0.0
+  min_height: 0.3
+  max_height: 0.7
+```
+
+`floor_z` is the flat floor elevation in map coordinates. The inclusive limits
+are `base_link` height above that floor in metres, not total robot or LiDAR
+height. Use the measured physical range for the working postures. Values must
+be finite and ordered. Enabling bounds requires fusion enabled. ICP may update all six axes; the
+height constraint runs after fusion and recovery, retaining their X/Y and
+orientation corrections while bounding the composed body height.
+
+Each body-odometry update projects the composed map-frame height onto the range
+by adjusting only the Z translation of `map -> odom`. The same constraint runs
+on initialization, accepted corrections, recovery, and manual pose resets.
+Within the range no adjustment occurs; crouching and standing remain possible.
+This bounds height but does not correct drift within the range or guarantee
+foot contact. FAST-LIO `/Odometry_loc`, `odom -> base_link`, and navigation
+`/odom` remain unchanged and can still drift vertically. No floor detection or
+foot-contact estimation is added. Covariance is preserved because clipping is
+not an independent height measurement.
+
+`/localization_3d_diagnostics` includes a `open3d_loc/height_bounds` status on
+body updates when enabled, plus height fields on fusion/registration diagnostics:
+`height_bounds_enabled`, `height_floor_z`, `height_min`, `height_max`,
+`height_before_bounds`, `height_published`, `height_adjustment`, and
+`height_clamp_count`. Heights are relative to `floor_z`; adjustment is a signed
+map-frame Z change. Validate TF/pose agreement and the range on recorded data
+before hardware use. To restore unrestricted height, disable `height_bounds`
+and restart; this does not change the ICP axis mask.
 
 ## Recovery parameters (`fusion.recovery`)
 
@@ -148,11 +189,12 @@ count identify which stage is rejecting work.
    diagnostics never enter `confirming`, use multi-start yaw ICP or another
    global-hypothesis method; do not compensate by allowing an immediate
    pi-radian recovery step.
-8. Decide the attitude policy deliberately. The current YAML permits ICP roll
-   and pitch correction. If the map is level and IMU attitude is reliable,
-   disable those axes to avoid tilting `map -> odom`. Keep them enabled only
-   when recorded-bag testing shows that global map alignment corrects a real,
-   repeatable roll/pitch bias.
+8. Decide the height and attitude policy deliberately. The current YAML permits
+   ICP correction on all six axes and bounds the resulting body height. Height
+   bounds do not constrain roll/pitch or remove vertical drift within the range.
+   Start with correct floor alignment and validate attitude corrections on a
+   recorded bag. For a level map with reliable IMU attitude, disable roll/pitch
+   updates if ICP introduces tilt; Z updates can remain enabled with bounds.
 9. Keep cadence sustainable. If `localization_overrun_count` rises, first
    lower `maxpoints_target`/`maxpoints_source` or increase `voxelsize_fine`.
    Then increase `loc_frequence` only if needed. A busy node must not process

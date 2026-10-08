@@ -63,3 +63,13 @@ def test_global_localization_ros_logger_is_error_only():
     ).read_text(encoding="utf-8")
 
     assert "'--log-level', 'global_localization_node:=error'" in launch_source
+
+
+def test_flat_floor_height_bounds_configuration():
+    configuration = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8"))
+    parameters = configuration["global_localization_node"]["ros__parameters"]
+    assert parameters["height_bounds"] == {
+        "enabled": True, "floor_z": 0.0, "min_height": 0.3, "max_height": 0.7,
+    }
+    assert parameters["fusion"]["enabled"] is True
+    assert all(parameters["fusion"]["update_mask"])
