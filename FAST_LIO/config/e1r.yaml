@@ -9,6 +9,19 @@
     runtime_pos_log_enable: false
     map_file_path: "./test.pcd"
 
+    # Startup-only tracking limits; restart localization after changing them.
+    tracking:
+      # a1614b8 allowed 5 scan points and 1 match; the current shared limit
+      # requires at least 6, which is the closest supported legacy threshold.
+      min_features: 6               # Minimum scan points and accepted matches
+      min_feature_ratio: 0.20       # Accepted matches / downsampled points
+      max_residual_rms: 0.15        # metres
+      min_information_ratio: 0.0001 # Geometry observability threshold
+      max_imu_gap: 0.05             # seconds
+      prediction_timeout: 0.5       # seconds without a trusted update
+      max_speed: 3.0                # m/s
+      max_angular_speed: 3.0        # rad/s
+
     common:
       lid_topic: "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"
       imu_topic: "/aima/hal/sensor/lidar_chest_front/imu"
