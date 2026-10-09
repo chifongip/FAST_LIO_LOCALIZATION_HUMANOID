@@ -1,3 +1,4 @@
+#include "open3d_loc/startup_recovery.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include <fast_lio/msg/tracking_status.hpp>
 #include <fast_lio/tracking_guard.hpp>
@@ -324,6 +325,30 @@ private:
     Eigen::Matrix4d pending_body_pose_ = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d trusted_body_pose_ = Eigen::Matrix4d::Identity();
     bool have_trusted_body_pose_ = false;
+    open3d_loc::StartupRecovery startup_;
+    double last_global_output_wall_ = 0.0;
+    Eigen::Matrix4d acquisition_pose_ = Eigen::Matrix4d::Identity();
+    static double SteadySeconds()
+    {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void ReportStartup()
+    {
+        diagnostic_msgs::msg::DiagnosticArray diagnostics;
+        diagnostics.header.stamp = now();
+        diagnostic_msgs::msg::DiagnosticStatus entry;
+        entry.name = "open3d_loc/startup"; entry.hardware_id = "open3d_loc";
+        entry.level = startup_.ready ? 0 : startup_.error(SteadySeconds()) ? 2 : 1;
+        entry.message = startup_.phase;
+        entry.values.push_back(DiagnosticValue("ready", startup_.ready ? "true" : "false"));
+        entry.values.push_back(DiagnosticValue("attempt", std::to_string(startup_.retries)));
+        entry.values.push_back(DiagnosticValue("instance", std::to_string(tracking_instance_)));
+        entry.values.push_back(DiagnosticValue("generation", std::to_string(tracking_generation_)));
+        entry.values.push_back(DiagnosticValue("acquisition_serial", std::to_string(reset_serial_)));
+        entry.values.push_back(DiagnosticValue("last_failure", startup_.last_failure));
+        diagnostics.status.push_back(std::move(entry));
+        pub_fusion_diagnostics_->publish(diagnostics);
+    }
     double min_information_ratio_ = 1e-4;
 
     nav_msgs::msg::Odometry::SharedPtr pending_odometry_;
@@ -401,12 +426,22 @@ private:
             [this, serial](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
                 reset_inflight_ = false;
                 if (serial != reset_serial_) {DispatchReset(); return;}
-                auto response = future.get();
+                std_srvs::srv::Trigger::Response::SharedPtr response;
+                try {
+                    response = future.get();
+                } catch (const std::exception & error) {
+                    reset_acknowledged_ = true; reset_failed_ = true;
+                    startup_.fault("backend_reset_failed");
+                    ReportRegistrationFailure(std::string("FAST-LIO reset request failed: ") + error.what());
+                    ReportResetStatus(2, "backend_reset_failed");
+                    return;
+                }
                 if (!response->success) {
                     reset_acknowledged_ = true;
                     reset_failed_ = true;
                     ReportRegistrationFailure("FAST-LIO reset failed: " + response->message);
                     ReportResetStatus(2, "backend_reset_failed");
+                    startup_.fault("backend_reset_failed");
                     return;
                 }
                 try {
@@ -427,6 +462,7 @@ private:
                     reset_failed_ = true;
                     ReportRegistrationFailure(std::string("Invalid FAST-LIO reset acknowledgment: ") + error.what());
                     ReportResetStatus(2, "invalid_reset_acknowledgment");
+                    startup_.fault("invalid_reset_acknowledgment");
                 }
                 reset_acknowledged_ = true;
                 if (!reset_failed_) ReportResetStatus(1, "waiting_for_local_tracking");
@@ -435,8 +471,12 @@ private:
         reset_request_id_ = pending.request_id;
     }
 
-    void BeginReset(const Eigen::Matrix4d & desired)
+    void BeginReset(const Eigen::Matrix4d & desired, bool automatic = false)
     {
+        if (!automatic) {
+            acquisition_pose_ = desired;
+            startup_.begin(SteadySeconds());
+        }
         pending_body_pose_ = desired;
         ++reset_serial_;
         reset_pending_ = true;
@@ -702,6 +742,11 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     min_information_ratio_ = declare_parameter<double>("fusion.min_information_ratio", 1e-4, information_descriptor);
     if (!std::isfinite(min_information_ratio_) || min_information_ratio_ <= 0.0 ||
         min_information_ratio_ > 1.0) throw std::invalid_argument("invalid fusion.min_information_ratio");
+    startup_.enabled = declare_parameter<bool>("startup_recovery.enabled", true, information_descriptor);
+    startup_.retry_backoff = declare_parameter<double>("startup_recovery.retry_backoff", 1.0, information_descriptor);
+    startup_.warning_timeout = declare_parameter<double>("startup_recovery.warning_timeout", 10.0, information_descriptor);
+    startup_.validate();
+    startup_.begin(SteadySeconds());
     reset_client_ = create_client<std_srvs::srv::Trigger>("/fast_lio/reset_tracking");
     tracking_sub_ = create_subscription<fast_lio::msg::TrackingStatus>(
         "/fast_lio/tracking_status", rclcpp::QoS(1).reliable().transient_local(),
@@ -728,7 +773,9 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
                         cumulative_odom_rotation_ = 0.0;
                         last_fusion_prediction_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
                         if (!reset_pending_) {
-                            pending_body_pose_ = have_trusted_body_pose_ ? trusted_body_pose_ : mat_baselink2map_;
+                            acquisition_pose_ = have_trusted_body_pose_ ? trusted_body_pose_ : acquisition_pose_;
+                            startup_.begin(SteadySeconds());
+                            pending_body_pose_ = acquisition_pose_;
                             reset_pending_ = true;
                             reset_acknowledged_ = true;
                             reset_started_generation_ = tracking_generation_;
@@ -752,6 +799,10 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
                     if (accepted_tracking_stamps_.size() > 32) accepted_tracking_stamps_.pop_front();
                 }
             }
+            if (status->state == fast_lio::msg::TrackingStatus::LOST) {
+                startup_.lost(status->instance_id, status->generation, status->reason, SteadySeconds());
+            } else if (!tracking_ready_) startup_.unavailable();
+            else startup_.waiting("waiting_for_global_registration");
             if (invalidate) {
                 ClearScanHistory();
                 pending_odometry_.reset(); pending_scan_.reset();
@@ -766,7 +817,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
             Eigen::Matrix4d desired;
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
-                desired = have_trusted_body_pose_ ? trusted_body_pose_ : mat_initialpose_;
+                desired = have_trusted_body_pose_ ? trusted_body_pose_ : acquisition_pose_;
                 if (!have_trusted_body_pose_ && height_bounds_.enabled)
                     desired(2, 3) = height_bounds_.floor_z + std::clamp(
                     mat_initialpose_(2, 3) - height_bounds_.floor_z,
@@ -786,6 +837,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
             reset_failed_ = true;
             ReportRegistrationFailure("FAST-LIO reset service timeout; reset remains unavailable");
             ReportResetStatus(2, "backend_reset_timeout");
+            startup_.fault("backend_reset_timeout");
         }
         if (reset_pending_ && !reset_acknowledged_ &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - reset_wait_started_).count() > 5.0) {
@@ -793,9 +845,19 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
             reset_failed_ = true;
             ReportRegistrationFailure("FAST-LIO reset service unavailable; retry initialpose after restoring service");
             ReportResetStatus(2, "backend_reset_unavailable");
+            startup_.fault("backend_reset_unavailable");
+        }
+        if (startup_.take_retry(SteadySeconds(), reset_inflight_ || reset_failed_ ||
+            (reset_pending_ && !reset_acknowledged_))) {
+            RCLCPP_WARN(get_logger(), "Coordinated startup retry %lu: %s",
+                static_cast<unsigned long>(startup_.retries), startup_.last_failure.c_str());
+            BeginReset(acquisition_pose_, true);
         }
         DispatchReset();
         DrainTrackingInputs();
+        if (startup_.ready && SteadySeconds() - last_global_output_wall_ > 0.5)
+            startup_.unavailable();
+        ReportStartup();
         bool hold;
         {
             std::lock_guard<std::mutex> lock(lock_state_);
@@ -1026,6 +1088,12 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     mat_initialpose_.block<3, 3>(0, 0) = Euler2Matrix3d(Eigen::Vector3d(initialpose_[3], initialpose_[4], initialpose_[5]));
     mat_initialpose_.block<3, 1>(0, 3) = Eigen::Vector3d(initialpose_[0], initialpose_[1], initialpose_[2]);
 
+    acquisition_pose_ = mat_initialpose_;
+    if (height_bounds_.enabled)
+        acquisition_pose_(2, 3) = height_bounds_.floor_z + std::clamp(
+            acquisition_pose_(2, 3) - height_bounds_.floor_z,
+            height_bounds_.min_height, height_bounds_.max_height);
+
     // 读取地图
     std::string path_map = "";
     this->declare_parameter<std::string>("path_map", "");
@@ -1059,7 +1127,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     mat_imulink2baselink_ = Eigen::Matrix4d::Identity();
     mat_baselink2motionlink_ = Eigen::Matrix4d::Identity();
 
-    RCLCPP_WARN(this->get_logger(), "initialize finished");
+    RCLCPP_WARN(this->get_logger(), "Map loading complete; waiting for local tracking and global registration");
 
     br_odom2map_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
@@ -1151,6 +1219,12 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
                 static_cast<unsigned long>(expected_reset_generation_), reset_acknowledged_, reset_failed_);
             return;
         }
+    }
+    if (publish_robot_root_tf_ && !tf_buffer_.canTransform(
+        body_frame_, imu_frame_, rclcpp::Time(baselink2odom->header.stamp),
+        rclcpp::Duration::from_seconds(0.0))) {
+        startup_.waiting("waiting_for_timestamped_tf");
+        return;
     }
     Eigen::Matrix4d mat_body_to_imu = Eigen::Matrix4d::Identity();
     if (!GetTfTransformToMatrix(body_frame_, imu_frame_, baselink2odom->header.stamp, mat_body_to_imu))
@@ -1386,6 +1460,12 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         transform_body2odom.transform.rotation = body_pose.orientation;
         RememberTransform(transform_body2odom);
     }
+
+    // Close acquisition as soon as the required map/body outputs are released.
+    // Optional torso output TF must not leave automatic resets armed after Nav2 can start.
+    last_global_output_wall_ = SteadySeconds();
+    startup_.complete();
+    ReportStartup();
 
     /// 卡尔曼滤波 - 只在定位初始化完成后执行
     if (localization_initialized)
@@ -2169,7 +2249,7 @@ void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWith
     Eigen::Matrix4d desired;
     {
         std::lock_guard<std::mutex> lock(lock_state_);
-        desired = have_trusted_body_pose_ ? trusted_body_pose_ : mat_initialpose_;
+        desired = have_trusted_body_pose_ ? trusted_body_pose_ : acquisition_pose_;
         if (!have_trusted_body_pose_ && height_bounds_.enabled)
             desired(2, 3) = height_bounds_.floor_z + std::clamp(
                     mat_initialpose_(2, 3) - height_bounds_.floor_z,

@@ -14,13 +14,15 @@ class ImuReceiver
 {
 public:
   ImuReceiver(rclcpp::Node & node, const std::string & topic, int depth,
-    std::function<void(sensor_msgs::msg::Imu::UniquePtr)> callback)
+    std::function<void(sensor_msgs::msg::Imu::UniquePtr)> callback, bool reliable = false)
   {
     group_ = node.create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
     rclcpp::SubscriptionOptions options;
     options.callback_group = group_;
+    auto qos = rclcpp::SensorDataQoS().keep_last(depth);
+    if (reliable) qos.reliable();
     subscription_ = node.create_subscription<sensor_msgs::msg::Imu>(
-      topic, rclcpp::SensorDataQoS().keep_last(depth), std::move(callback), options);
+      topic, qos, std::move(callback), options);
     executor_.add_callback_group(group_, node.get_node_base_interface());
     thread_ = std::thread([this]() {
       // Bounded spin_once also makes stop safe before this thread starts spinning.

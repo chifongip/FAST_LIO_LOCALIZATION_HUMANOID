@@ -10,17 +10,19 @@ import pytest
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from fast_lio.msg import TrackingStatus
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2, PointField
 from sensor_msgs_py.point_cloud2 import create_cloud
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
+from tf2_msgs.msg import TFMessage
 import yaml
 
 
-def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("imu_reliability", ["best_effort", "reliable"])
+def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_reliability):
     monkeypatch.setenv("ROS_DOMAIN_ID", str(170 + os.getpid() % 30))
     monkeypatch.delenv("FASTRTPS_DEFAULT_PROFILES_FILE", raising=False)
     environment = os.environ.copy()
@@ -40,6 +42,7 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
     )
     fast_parameters = {
         "tracking.startup_warning_timeout": 0.2,
+        "tracking.imu_reliability": imu_reliability,
         "common.lid_topic": "/test/lidar",
         "common.imu_topic": "/test/imu",
         "preprocess.lidar_type": 5,
@@ -66,13 +69,14 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
     global_parameters = {
         "path_map": str(map_path),
         "initialpose": [0.0] * 6,
-        "imu_frame": "base_link",
+        "imu_frame": "test_imu",
         "output_frame": "base_link",
         "publish_output_tf": False,
         "publish_robot_root_tf": True,
         "fusion.enabled": True,
         "fusion.update_mask": [True] * 6,
-        "pcd_queue_maxsize": 1,
+        "pcd_queue_maxsize": 8,
+        "startup_recovery.retry_backoff": 0.2,
         "loc_frequence": 0.1,
         "voxelsize_fine": 0.1,
         "threshold_fitness": 0.8,
@@ -86,7 +90,20 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
     node = rclpy.create_node("tracking_recovery_test")
     imu_pub = node.create_publisher(
         Imu, "/test/imu",
-        QoSProfile(depth=1000, reliability=ReliabilityPolicy.BEST_EFFORT),
+        QoSProfile(depth=1000, reliability=ReliabilityPolicy.RELIABLE),
+    )
+    tf_pub = node.create_publisher(TFMessage, "/tf", 20)
+    publish_joint_tf = False
+    global_diagnostics = []
+    node.create_subscription(
+        DiagnosticArray, "/localization_3d_diagnostics", global_diagnostics.append, 20
+    )
+    root_transforms = []
+    node.create_subscription(
+        TFMessage, "/tf",
+        lambda m: root_transforms.extend(
+            t for t in m.transforms if t.header.frame_id == "map"
+        ), 20,
     )
     cloud_pub = node.create_publisher(PointCloud2, "/test/lidar", 10)
     pose_pub = node.create_publisher(
@@ -165,6 +182,13 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
                 for i, (x, y, z) in enumerate(cloud_points)
             ],
         )
+        if publish_joint_tf:
+            transform = TransformStamped(
+                header=Header(stamp=stamp(end + 5_000_000), frame_id="base_link"),
+                child_frame_id="test_imu",
+            )
+            transform.transform.rotation.w = 1.0
+            tf_pub.publish(TFMessage(transforms=[transform]))
         cloud_pub.publish(cloud)
         deadline = cycle_started + 0.1
         while time.monotonic() < deadline:
@@ -193,6 +217,11 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
                     for s in statuses[-10:]
                 ]
             )
+            + "\nglobal diagnostics="
+            + repr([
+                (entry.name, entry.message, {v.key: v.value for v in entry.values})
+                for message in global_diagnostics[-10:] for entry in message.status
+            ])
             + "\n"
             + "\n".join(p.read_text()[-12000:] for p in tmp_path.glob("*.log"))
         )
@@ -241,6 +270,15 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         while not (cloud_pub.get_subscription_count() and imu_pub.get_subscription_count()):
             assert time.monotonic() < deadline
             rclpy.spin_once(node, timeout_sec=0.01)
+        expected_reliability = (
+            ReliabilityPolicy.RELIABLE if imu_reliability == "reliable"
+            else ReliabilityPolicy.BEST_EFFORT
+        )
+        assert any(
+            endpoint.node_name == "laser_mapping"
+            and endpoint.qos_profile.reliability == expected_reliability
+            for endpoint in node.get_subscriptions_info_by_topic("/test/imu")
+        )
         for _ in range(5):
             pump(publish_imu=False)
         # Volatile diagnostics discovery can lag the sensor subscriptions.
@@ -254,11 +292,31 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
             publish_imu=False,
         )
         assert not odometry
+        until(lambda: statuses and statuses[-1].state == TrackingStatus.TRACKING)
+        assert not localization
+        assert not root_transforms
+        generation = statuses[-1].generation
+        # LIO has accepted a pose, but exact joint TF and global registration
+        # are not ready. A real gap here must trigger a coordinated retry.
+        for _ in range(3):
+            pump(publish_imu=False)
+        until(lambda: statuses[-1].generation > generation)
+        publish_joint_tf = True
         until(
             lambda: localization
             and statuses[-1].state == TrackingStatus.TRACKING
+            and any(
+                entry.name == "open3d_loc/startup" and entry.message == "ready"
+                for message in global_diagnostics for entry in message.status
+            )
         )
-        assert statuses[-1].generation == 0
+        assert root_transforms
+        assert statuses[-1].generation > 0
+        assert any(
+            value.key == "attempt" and int(value.value) >= 1
+            for message in global_diagnostics for entry in message.status
+            if entry.name == "open3d_loc/startup" for value in entry.values
+        )
         assert any(
             float(value.value) >= 1
             for message in diagnostics for entry in message.status
@@ -269,8 +327,10 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         assert abs(good_position.z) < 0.05
 
         # Short loss recovers against the preserved local map without reset.
-        pump(cloud_points=points[::300])
-        assert statuses[-1].state == TrackingStatus.DEGRADED
+        until(
+            lambda: statuses[-1].state == TrackingStatus.DEGRADED,
+            timeout=0.3, cloud_points=points[::300],
+        )
         until(lambda: statuses[-1].state == TrackingStatus.TRACKING, timeout=2)
         assert statuses[-1].generation == good_generation
 
@@ -280,8 +340,10 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
             for point in points[::3]
             if abs(point[0]) < 1.3 and abs(point[1]) < 1.3
         ]
-        pump(cloud_points=plane_interior)
-        assert statuses[-1].state == TrackingStatus.DEGRADED
+        until(
+            lambda: statuses[-1].state == TrackingStatus.DEGRADED,
+            timeout=0.3, cloud_points=plane_interior,
+        )
         assert statuses[-1].reason == "degenerate_geometry"
         until(lambda: statuses[-1].state == TrackingStatus.TRACKING, timeout=2)
 
@@ -296,10 +358,14 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         assert statuses[-1].state == TrackingStatus.LOST
         assert diagnostics[-1].status[0].values == lost_values
         generation = statuses[-1].generation
+        reset_time = node.get_clock().now().nanoseconds
         request_pose()
         until(
             lambda: statuses[-1].generation > generation
             and statuses[-1].state == TrackingStatus.TRACKING
+            and localization
+            and rclpy.time.Time.from_msg(localization[-1].header.stamp).nanoseconds
+            > reset_time
         )
         good_generation = statuses[-1].generation
 
@@ -383,33 +449,47 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         assert statuses[-1].reason == "implausible_prediction"
         assert odometry[-1] == held
 
-        # A backend restart has a new instance and generation zero.
-        instance = statuses[-1].instance_id
-        processes[0].send_signal(signal.SIGINT)
-        processes[0].wait(timeout=5)
-        restart_time = node.get_clock().now().nanoseconds
-        localization.clear()
-        last_imu_ns = 0
-        processes[0] = subprocess.Popen(
-            [
-                os.environ["FAST_LIO_EXECUTABLE"],
-                "--ros-args",
-                "--params-file",
-                str(tmp_path / "fast.yaml"),
-            ],
-            stdout=logs[0],
-            stderr=subprocess.STDOUT,
-            env=environment,
-        )
-        until(
-            lambda: statuses[-1].instance_id != instance
-            and statuses[-1].state == TrackingStatus.TRACKING
-            and localization
-            and rclpy.time.Time.from_msg(
-                localization[-1].header.stamp
-            ).nanoseconds
-            > restart_time
-        )
+        # Initial start plus nine restarts per QoS mode exercises twenty
+        # synthetic backend process starts across both parameterizations.
+        for restart_index in range(9):
+            # A backend restart has a new instance and generation zero.
+            instance = statuses[-1].instance_id
+            processes[0].send_signal(signal.SIGINT)
+            processes[0].wait(timeout=5)
+            if restart_index == 1:
+                # A silent backend exit cannot leave readiness true forever.
+                deadline = time.monotonic() + 0.8
+                while time.monotonic() < deadline:
+                    rclpy.spin_once(node, timeout_sec=0.01)
+                latest_startup = next(
+                    entry for message in reversed(global_diagnostics)
+                    for entry in message.status if entry.name == "open3d_loc/startup"
+                )
+                assert latest_startup.message == "tracking_unavailable"
+                assert {v.key: v.value for v in latest_startup.values}["ready"] == "false"
+            restart_time = node.get_clock().now().nanoseconds
+            localization.clear()
+            last_imu_ns = 0
+            processes[0] = subprocess.Popen(
+                [
+                    os.environ["FAST_LIO_EXECUTABLE"],
+                    "--ros-args",
+                    "--params-file",
+                    str(tmp_path / "fast.yaml"),
+                ],
+                stdout=logs[0],
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            until(
+                lambda: statuses[-1].instance_id != instance
+                and statuses[-1].state == TrackingStatus.TRACKING
+                and localization
+                and rclpy.time.Time.from_msg(
+                    localization[-1].header.stamp
+                ).nanoseconds
+                > restart_time
+            )
     finally:
         for process in processes:
             process.send_signal(signal.SIGINT)

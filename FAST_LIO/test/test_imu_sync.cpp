@@ -29,7 +29,7 @@ TEST(ImuSync, ChecksRetainedBoundaryAndInternalGap)
   EXPECT_EQ(imuCoverage({1.10, 1.105}, 1.09, 1.102, 1.0, .05, 0, .1, false).reason,
     "imu_time_gap");
   EXPECT_EQ(imuCoverage({1.0, 1.10}, 1.0, 1.09, -1, .05, 0, .1, false).reason,
-    "imu_time_gap");
+    "imu_scan_end_gap");
 }
 
 TEST(ImuSync, CoveredEmptyIntervalSkipsWithoutAdvancingEstimator)
@@ -37,7 +37,7 @@ TEST(ImuSync, CoveredEmptyIntervalSkipsWithoutAdvancingEstimator)
   EXPECT_EQ(imuCoverage({1.01}, 1.001, 1.004, 1.0, .05, 0, .1, false).action,
     ImuSyncAction::SKIP_SCAN);
   EXPECT_EQ(imuCoverage({1.10}, 1.001, 1.004, 1.0, .05, 0, .1, false).action,
-    ImuSyncAction::INVALID);
+    ImuSyncAction::SKIP_SCAN);
   EXPECT_EQ(imuCoverage({1.01}, 1.001, 1.004, -1, .05, 0, .1, false).action,
     ImuSyncAction::INVALID);
 }
@@ -68,4 +68,33 @@ TEST(ImuSync, ExactEndDoesNotRequireFutureCoverage)
 {
   EXPECT_EQ(imuCoverage({1, 1.005, 2}, 1, 1.005, -1, .05, 0, .1, false).action,
     ImuSyncAction::READY);
+}
+
+TEST(ImuSync, DoesNotRejectCoveredScanForFutureGap)
+{
+  const auto result = imuCoverage({1.005, 1.01, 1.1}, 1, 1.012, 1, .05, 0, .1, false);
+  EXPECT_EQ(result.action, ImuSyncAction::READY);
+  EXPECT_DOUBLE_EQ(result.following, 1.1);
+  EXPECT_EQ(imuCoverage({1.1, 1.105}, 1.012, 1.102, 1.01, .05, 0, .1, false).reason,
+    "imu_time_gap");
+}
+
+TEST(ImuSync, RecordsExactOffendingPairAndBoundary)
+{
+  const auto result = imuCoverage({1.005, 1.059287, 1.065, 1.11},
+    1, 1.1, 1, .05, 0, .1, false);
+  EXPECT_EQ(result.reason, "imu_time_gap");
+  EXPECT_DOUBLE_EQ(result.gap_before, 1.005);
+  EXPECT_DOUBLE_EQ(result.gap_after, 1.059287);
+  EXPECT_NEAR(result.gap, .054287, 1e-12);
+  EXPECT_DOUBLE_EQ(result.integration_boundary, 1);
+}
+
+TEST(ImuSync, HandlesUnixEpochRoundingAtGapLimit)
+{
+  const double start = 1791511234.05;
+  EXPECT_FALSE(fast_lio::imuGapExceeded((start + .05) - start, .05));
+  EXPECT_TRUE(fast_lio::imuGapExceeded((start + .05001) - start, .05));
+  EXPECT_EQ(imuCoverage({start, start + .05}, start, start + .05,
+    -1, .05, 0, .1, false).action, ImuSyncAction::READY);
 }

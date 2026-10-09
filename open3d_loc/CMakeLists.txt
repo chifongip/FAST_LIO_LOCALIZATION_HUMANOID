@@ -179,6 +179,8 @@ install(DIRECTORY
 )
 
 # Install include directory
+install(PROGRAMS scripts/capture_startup.py DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY include/
         DESTINATION include/${PROJECT_NAME}
 )
@@ -188,6 +190,9 @@ if(BUILD_TESTING)
         find_package(ament_cmake_gtest REQUIRED)
         find_package(ament_cmake_pytest REQUIRED)
         ament_lint_auto_find_test_dependencies()
+
+        ament_add_gtest(test_startup_recovery test/test_startup_recovery.cpp)
+        target_include_directories(test_startup_recovery PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
         ament_add_gtest(test_transform_utils test/test_transform_utils.cpp)
         target_include_directories(test_transform_utils PRIVATE
@@ -204,6 +209,11 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
         )
         target_link_libraries(test_global_correction_filter global_correction_filter Eigen3::Eigen)
+
+        ament_add_pytest_test(test_startup_capture test/test_startup_capture.py
+                TIMEOUT 30
+                ENV STARTUP_CAPTURE_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/scripts/capture_startup.py
+        )
 
         ament_add_pytest_test(test_e1r_launch test/test_e1r_launch.py)
         ament_add_pytest_test(test_height_bounds test/test_height_bounds.py

@@ -644,7 +644,11 @@ bool sync_packages(MeasureGroup &meas)
             const auto &later_imu = imu_buffer.front();
             const auto &later_gyro = later_imu->angular_velocity;
             const V3D later_measurement(later_gyro.x, later_gyro.y, later_gyro.z);
-            meas.gyro_at_lidar_end_valid = fast_lio::interpolateAngularVelocity(
+            const double later_time = get_time_sec(later_imu->header.stamp);
+            if (fast_lio::imuGapExceeded(later_time - earlier_time, tracking.limits.max_imu_gap)) {
+                meas.gyro_at_lidar_end = earlier_measurement;
+                meas.gyro_at_lidar_end_valid = earlier_measurement.allFinite();
+            } else meas.gyro_at_lidar_end_valid = fast_lio::interpolateAngularVelocity(
                 earlier_time, earlier_measurement,
                 get_time_sec(later_imu->header.stamp), later_measurement,
                 lidar_end_time, meas.gyro_at_lidar_end);
@@ -1084,6 +1088,10 @@ public:
         rcl_interfaces::msg::ParameterDescriptor tracking_descriptor;
         tracking_descriptor.read_only = true;
         tracking_descriptor.description = "Startup-only tracking protection limit";
+        const auto imu_reliability = declare_parameter<std::string>(
+            "tracking.imu_reliability", "best_effort", tracking_descriptor);
+        if (imu_reliability != "best_effort" && imu_reliability != "reliable")
+            throw std::invalid_argument("tracking.imu_reliability must be best_effort or reliable");
         const int imu_queue_depth = declare_parameter<int>("tracking.imu_queue_depth", 200, tracking_descriptor);
         sync_wait_timeout = declare_parameter<double>("tracking.sync_wait_timeout", 0.1, tracking_descriptor);
         startup_warning_timeout_ = declare_parameter<double>("tracking.startup_warning_timeout", 10.0, tracking_descriptor);
@@ -1251,7 +1259,7 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        imu_receiver_ = std::make_unique<fast_lio::ImuReceiver>(*this, imu_topic, imu_queue_depth, imu_cbk);
+        imu_receiver_ = std::make_unique<fast_lio::ImuReceiver>(*this, imu_topic, imu_queue_depth, imu_cbk, imu_reliability == "reliable");
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_1", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body_1", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected_1", 20);
@@ -1304,7 +1312,7 @@ public:
     }
 
 private:
-    bool seed_geometry_valid()
+    bool scan_geometry_valid()
     {
         if (feats_down_body->empty()) return false;
         Eigen::Vector3d mean = Eigen::Vector3d::Zero();
@@ -1379,12 +1387,16 @@ private:
         add("sync_wait", sync_wait_elapsed);
         add("scan_begin", Measures.lidar_beg_time);
         add("scan_end", lidar_end_time);
-        add("imu_batch_size", Measures.imu.size());
+        add("imu_batch_size", sync_coverage.count);
         add("imu_first", sync_coverage.first);
         add("imu_last", sync_coverage.last);
         add("imu_following", sync_coverage.following);
         add("imu_end_gap", sync_coverage.end_gap);
         add("imu_coverage_gap", sync_coverage.gap);
+        add("imu_gap_before", sync_coverage.gap_before);
+        add("imu_gap_after", sync_coverage.gap_after);
+        add("imu_integration_boundary", sync_coverage.integration_boundary);
+        add("sensor_epoch", sensor_epoch);
         diagnostic_msgs::msg::KeyValue sync_reason;
         sync_reason.key = "sync_reason"; sync_reason.value = sync_coverage.reason;
         entry.values.push_back(sync_reason);
@@ -1481,13 +1493,13 @@ private:
             const double stamp = get_time_sec(imu->header.stamp);
             if (previous >= 0.0) {
                 last_imu_gap_ = stamp - previous;
-                if (last_imu_gap_ <= 0.0 || last_imu_gap_ > tracking.limits.max_imu_gap) {
+                if (last_imu_gap_ <= 0.0 || fast_lio::imuGapExceeded(last_imu_gap_, tracking.limits.max_imu_gap)) {
                     tracking.lose("imu_time_gap"); return false;
                 }
             }
             previous = stamp;
         }
-        if (Measures.lidar_end_time - previous > tracking.limits.max_imu_gap) {
+        if (fast_lio::imuGapExceeded(Measures.lidar_end_time - previous, tracking.limits.max_imu_gap)) {
             tracking.lose("missing_imu_coverage"); return false;
         }
         last_batch_imu_ = previous;
@@ -1597,7 +1609,7 @@ private:
             if (ikdtree.Root_Node == nullptr)
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
-                if (feats_down_size >= tracking.limits.min_features && seed_geometry_valid())
+                if (feats_down_size >= tracking.limits.min_features && scan_geometry_valid())
                 {
                     ikdtree.set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
@@ -1621,6 +1633,15 @@ private:
                 tracking.reject(Measures.lidar_end_time, "insufficient_features");
                 publish_tracking();
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                return;
+            }
+
+            // Neighbor plane fitting can invent varied normals for collinear
+            // neighborhoods. A planar scan still cannot constrain six pose axes.
+            if (!scan_geometry_valid()) {
+                effct_feat_num = 0; measurement_information_ratio = 0.0;
+                tracking.reject(Measures.lidar_end_time, "degenerate_geometry");
+                publish_tracking();
                 return;
             }
 

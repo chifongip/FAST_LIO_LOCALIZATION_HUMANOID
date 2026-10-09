@@ -7,6 +7,13 @@
 
 namespace fast_lio
 {
+// Double seconds near current Unix epochs quantize timestamps by about 0.24 us.
+// Allow representation error, not an additional missing IMU interval.
+inline bool imuGapExceeded(double gap, double limit)
+{
+  return gap > limit + 1e-6;
+}
+
 enum class ImuSyncAction {READY, WAITING, SKIP_SCAN, INVALID};
 struct ImuCoverage
 {
@@ -14,6 +21,7 @@ struct ImuCoverage
   std::string reason = "waiting_for_imu_coverage";
   std::size_t count = 0;
   double first = -1.0, last = -1.0, following = -1.0, end_gap = 0.0, gap = 0.0;
+  double gap_before = -1.0, gap_after = -1.0, integration_boundary = -1.0;
 };
 
 inline ImuCoverage imuCoverage(const std::vector<double> & stamps, double scan_begin,
@@ -21,6 +29,7 @@ inline ImuCoverage imuCoverage(const std::vector<double> & stamps, double scan_b
   double wait_timeout, bool warmup)
 {
   ImuCoverage result;
+  result.integration_boundary = previous_sample;
   auto invalid = [&result](const std::string & reason) {
     result.action = ImuSyncAction::INVALID;
     result.reason = reason;
@@ -52,8 +61,8 @@ inline ImuCoverage imuCoverage(const std::vector<double> & stamps, double scan_b
     // Only the most recent continuous 200 ms are needed to initialize.
     auto first = boundary;
     if (first != stamps.begin()) --first;
-    while (first != stamps.begin() && *first - *(first - 1) <= max_gap) --first;
-    if (result.last < 0.0 || result.last - *first < 0.2 || *first > scan_begin) {
+    while (first != stamps.begin() && !imuGapExceeded(*first - *(first - 1), max_gap)) --first;
+    if (result.last < 0.0 || result.last - *first + 1e-6 < 0.2 || *first > scan_begin) {
       result.action = ImuSyncAction::SKIP_SCAN;
       result.reason = "startup_imu_window";
       return result;
@@ -64,18 +73,25 @@ inline ImuCoverage imuCoverage(const std::vector<double> & stamps, double scan_b
   double previous = warmup ? -1.0 : previous_sample;
   for (auto it = stamps.begin(); it != stamps.end(); ++it) {
     if (warmup && *it < result.first) continue;
+    // The future sample is only a watermark. Do not integrate or gate its gap.
+    if (*it > scan_end) break;
     if (!std::isfinite(*it) || (previous >= 0.0 &&
       *it <= previous))
       return invalid("timestamp_regression");
     if (previous >= 0.0) {
       result.gap = std::max(result.gap, *it - previous);
-      if (*it - previous > max_gap) return invalid("imu_time_gap");
+      if (imuGapExceeded(*it - previous, max_gap)) {
+        result.gap_before = previous; result.gap_after = *it;
+        return invalid("imu_time_gap");
+      }
     }
     previous = *it;
     if (*it >= scan_end) break;
   }
-  if (result.last < 0.0 || result.end_gap > max_gap)
+  if (result.last < 0.0 || imuGapExceeded(result.end_gap, max_gap)) {
+    result.gap_before = result.last; result.gap_after = scan_end;
     return invalid("imu_scan_end_gap");
+  }
   if (!result.count) {
     result.action = ImuSyncAction::SKIP_SCAN;
     result.reason = "covered_empty_imu_interval";

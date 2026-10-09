@@ -392,3 +392,73 @@ and the complete `map -> odom -> base_link` TF chain. Confirm that a genuine
 post-start IMU outage latches LOST and that `/initialpose` performs a coordinated
 reset and recovery. Local synthetic tests run in separate ROS domains and do
 not restart or command a connected robot.
+
+### Coordinated startup recovery
+
+Acquisition stays open through local tracking, three global-registration
+confirmations, and publication of valid global odometry and map/body TF. Local
+`TRACKING` alone does not finish acquisition. When robot-root TF publication is
+enabled, the sensor-to-base transform must be available at the odometry timestamp;
+a latest-transform fallback does not satisfy this requirement. Optional torso
+output TF does not keep automatic recovery armed after the required map/body
+outputs have been released.
+
+Before acquisition completes, eligible timing failures cause a coordinated
+reset using the original requested pose. A cold start preserves the configured
+initial pose and height bounds; `/initialpose` replaces that acquisition anchor.
+Partial ICP estimates never replace it during retries. Automatic resets are
+serialized and deduplicated by estimator instance and generation. Operator
+requests supersede pending retries. After readiness, LOST remains latched until
+an explicit reset; restarting the backend opens a new acquisition using the last
+trusted global pose. Reset-service failure, invalid acknowledgment, and timeout
+stop automatic recovery until an operator request.
+
+Startup-only global settings are:
+
+```yaml
+startup_recovery:
+  enabled: true
+  retry_backoff: 1.0
+  warning_timeout: 10.0
+```
+
+Backoff and warning timeout must be finite and positive. Eligible timing failures
+continue retrying after the warning deadline, with ERROR diagnostics. Nonfinite
+IMU data, timestamp regression, and buffer overflow remain fail-closed.
+`open3d_loc/startup` on `/localization_3d_diagnostics` reports phase, readiness,
+automatic retry count (`attempt`), instance, generation, acquisition serial, and
+last failure every 100 ms after node construction. Readiness expires after
+500 ms without a fresh global map/body output; this never reopens automatic
+acquisition after a previously ready run.
+
+FAST-LIO adds startup-only `tracking.imu_reliability` with values `best_effort`
+(default) and `reliable`. Reliable reception requires a compatible reliable IMU
+publisher. Queue depth remains 200 by default. The 50 ms default gap limit is
+unchanged (with a 1 microsecond tolerance for double-precision Unix timestamp
+rounding). Coverage checks apply to the actual integration interval; a long gap
+to the following sample cannot reject an already covered scan. Gyro interpolation
+across such a gap uses the preceding valid measurement instead. The gap is
+rejected when it enters a subsequent integration interval. The existing
+three-dimensional scan-geometry gate now protects every measurement update,
+so ill-conditioned neighbor plane fits cannot make a planar scan appear
+observable in all six pose axes. Frozen failure
+records include the offending timestamp pair, integration boundary, candidate
+batch size, sensor epoch, and queue/arrival metrics.
+
+For a read-only cold-start transport capture, start this command before the
+coordinated stationary launch:
+
+```bash
+ROS_DOMAIN_ID=20 ros2 run open3d_loc capture_startup.py \
+  --duration 60 --output /tmp/localization-startup.jsonl
+```
+
+The tool creates an exclusive JSONL file, subscribes to IMU with both reliability
+modes, and records tracking, diagnostics, odometry, and TF without calling reset
+services or publishing commands. It summarizes timestamp gaps and unmatched IMU
+timestamps. Discovery and capture boundaries can also cause unmatched samples;
+a healthy later capture cannot prove the origin of an earlier failure. Captures
+and maps must stay out of Git. Keep the runtime reliability setting unchanged
+until a simultaneous cold-start capture supports changing it. Hardware rollout
+still requires twenty coordinated stationary cold starts with advancing odometry
+and the complete TF chain; synthetic backend restarts do not replace that check.
