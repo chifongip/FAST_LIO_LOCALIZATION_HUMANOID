@@ -1,4 +1,7 @@
 #include "open3d_loc/startup_recovery.hpp"
+#include "open3d_loc/runtime_recovery.hpp"
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <fast_lio/msg/tracking_status.hpp>
 #include <fast_lio/tracking_guard.hpp>
@@ -326,6 +329,47 @@ private:
     Eigen::Matrix4d trusted_body_pose_ = Eigen::Matrix4d::Identity();
     bool have_trusted_body_pose_ = false;
     open3d_loc::StartupRecovery startup_;
+    open3d_loc::RuntimeRecovery runtime_;
+    Eigen::Matrix4d runtime_anchor_ = Eigen::Matrix4d::Identity();
+    std::uint8_t previous_tracking_state_ = 0;
+    double recovery_imu_offset_ = 0.0;
+    double trusted_body_wall_ = -1e30;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr command_feedback_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr recovery_imu_;
+
+    void HoldRuntimeFault()
+    {
+        if (!runtime_.blocked) return;
+        // Invalidate workers and prevent any late reset/registration result releasing output.
+        if (!reset_failed_) {
+            std::lock_guard<std::mutex> lock(lock_state_);
+            ++fusion_generation_;
+            loc_initialized_ = false;
+            accepted_tracking_stamps_.clear();
+        }
+        reset_pending_ = true;
+        reset_failed_ = true;
+        startup_.fault("runtime_recovery_" + runtime_.blocker);
+    }
+    void ReportRuntime()
+    {
+        diagnostic_msgs::msg::DiagnosticArray diagnostics;
+        diagnostics.header.stamp = now();
+        diagnostic_msgs::msg::DiagnosticStatus entry;
+        entry.name = "open3d_loc/runtime_recovery";
+        entry.hardware_id = "open3d_loc";
+        entry.message = runtime_.phase;
+        entry.level = runtime_.blocked ? 2 : runtime_.active ? 1 : 0;
+        entry.values.push_back(DiagnosticValue("blocker", runtime_.blocker));
+        entry.values.push_back(DiagnosticValue("reason", runtime_.reason));
+        entry.values.push_back(DiagnosticValue("attempt", std::to_string(runtime_.attempts)));
+        entry.values.push_back(DiagnosticValue("operator_required", runtime_.blocked ? "true" : "false"));
+        entry.values.push_back(DiagnosticValue("command_age", std::to_string(runtime_.command_elapsed(SteadySeconds()))));
+        entry.values.push_back(DiagnosticValue("imu_age", std::to_string(runtime_.imu_elapsed(SteadySeconds()))));
+        entry.values.push_back(DiagnosticValue("anchor_age_at_loss", std::to_string(runtime_.anchor_age)));
+        diagnostics.status.push_back(std::move(entry));
+        pub_fusion_diagnostics_->publish(diagnostics);
+    }
     double last_global_output_wall_ = 0.0;
     Eigen::Matrix4d acquisition_pose_ = Eigen::Matrix4d::Identity();
     static double SteadySeconds()
@@ -471,9 +515,10 @@ private:
         reset_request_id_ = pending.request_id;
     }
 
-    void BeginReset(const Eigen::Matrix4d & desired, bool automatic = false)
+    void BeginReset(const Eigen::Matrix4d & desired, bool automatic = false, bool runtime = false)
     {
         if (!automatic) {
+            if (!runtime) runtime_.operator_reset();
             acquisition_pose_ = desired;
             startup_.begin(SteadySeconds());
         }
@@ -746,15 +791,78 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
     startup_.retry_backoff = declare_parameter<double>("startup_recovery.retry_backoff", 1.0, information_descriptor);
     startup_.warning_timeout = declare_parameter<double>("startup_recovery.warning_timeout", 10.0, information_descriptor);
     startup_.validate();
+    runtime_.enabled = declare_parameter<bool>("runtime_recovery.enabled", false, information_descriptor);
+    runtime_.max_attempts = declare_parameter<int>("runtime_recovery.max_attempts", 3, information_descriptor);
+    runtime_.settle = declare_parameter<double>("runtime_recovery.settle", runtime_.settle, information_descriptor);
+    runtime_.command_age = declare_parameter<double>("runtime_recovery.command_max_age", runtime_.command_age, information_descriptor);
+    runtime_.imu_age = declare_parameter<double>("runtime_recovery.imu_max_age", runtime_.imu_age, information_descriptor);
+    runtime_.linear_limit = declare_parameter<double>("runtime_recovery.linear_limit", runtime_.linear_limit, information_descriptor);
+    runtime_.angular_limit = declare_parameter<double>("runtime_recovery.angular_limit", runtime_.angular_limit, information_descriptor);
+    runtime_.gyro_limit = declare_parameter<double>("runtime_recovery.gyro_limit", runtime_.gyro_limit, information_descriptor);
+    runtime_.gravity_tolerance = declare_parameter<double>("runtime_recovery.gravity_tolerance", runtime_.gravity_tolerance, information_descriptor);
+    runtime_.acceleration_rms = declare_parameter<double>("runtime_recovery.acceleration_rms", runtime_.acceleration_rms, information_descriptor);
+    runtime_.anchor_age_limit = declare_parameter<double>("runtime_recovery.anchor_max_age", runtime_.anchor_age_limit, information_descriptor);
+    runtime_.retry_backoff = declare_parameter<double>("runtime_recovery.retry_backoff", runtime_.retry_backoff, information_descriptor);
+    runtime_.attempt_timeout = declare_parameter<double>("runtime_recovery.attempt_timeout", runtime_.attempt_timeout, information_descriptor);
+    runtime_.budget_rearm = declare_parameter<double>("runtime_recovery.budget_rearm", runtime_.budget_rearm, information_descriptor);
+    recovery_imu_offset_ = declare_parameter<double>("runtime_recovery.imu_time_offset_sec", 0.0, information_descriptor);
+    if (!std::isfinite(recovery_imu_offset_)) throw std::invalid_argument("invalid recovery IMU time offset");
+    runtime_.validate();
+    runtime_.operator_reset();
+    const auto command_topic = declare_parameter<std::string>(
+        "runtime_recovery.command_topic", "/navigation/final_command", information_descriptor);
+    const auto recovery_imu_topic = declare_parameter<std::string>(
+        "runtime_recovery.imu_topic", "/livox/imu", information_descriptor);
+    if (command_topic.empty() || recovery_imu_topic.empty())
+        throw std::invalid_argument("runtime recovery topics must not be empty");
+    if (runtime_.enabled) {
+        command_feedback_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+            command_topic, rclcpp::QoS(10), [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg) {
+                const auto & v = msg->twist;
+                const double linear = std::sqrt(v.linear.x*v.linear.x + v.linear.y*v.linear.y + v.linear.z*v.linear.z);
+                const double angular = std::sqrt(v.angular.x*v.angular.x + v.angular.y*v.angular.y + v.angular.z*v.angular.z);
+                const auto stamp = static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec;
+                const double age = (now().nanoseconds() - stamp) * 1e-9;
+                runtime_.command(SteadySeconds(), stamp, linear, angular,
+                    command_feedback_->get_publisher_count() == 1 && msg->header.stamp.sec >= 0 &&
+                    msg->header.stamp.nanosec < 1000000000U && age >= -0.05 && age <= runtime_.command_age);
+                if (runtime_.active && runtime_.started() && !runtime_.quiet(SteadySeconds())) {
+                    runtime_.faulted(runtime_.blocker); HoldRuntimeFault();
+                }
+            });
+        recovery_imu_ = create_subscription<sensor_msgs::msg::Imu>(
+            recovery_imu_topic, rclcpp::SensorDataQoS(), [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+                const auto & a = msg->linear_acceleration;
+                const auto & w = msg->angular_velocity;
+                const auto stamp = static_cast<std::int64_t>(msg->header.stamp.sec) * 1000000000LL + msg->header.stamp.nanosec;
+                const double age = (now().nanoseconds() - stamp) * 1e-9 - recovery_imu_offset_;
+                const bool fresh = msg->header.stamp.sec >= 0 && msg->header.stamp.nanosec < 1000000000U &&
+                    age >= -0.05 && age <= runtime_.imu_age && recovery_imu_->get_publisher_count() == 1 &&
+                    msg->angular_velocity_covariance[0] != -1.0 &&
+                    msg->linear_acceleration_covariance[0] != -1.0;
+                runtime_.imu(SteadySeconds(), stamp,
+                    {a.x, a.y, a.z}, fresh ? std::sqrt(w.x*w.x + w.y*w.y + w.z*w.z) :
+                    std::numeric_limits<double>::quiet_NaN());
+                if (runtime_.active && runtime_.started() && !runtime_.quiet(SteadySeconds())) {
+                    runtime_.faulted(runtime_.blocker); HoldRuntimeFault();
+                }
+            });
+    }
     startup_.begin(SteadySeconds());
     reset_client_ = create_client<std_srvs::srv::Trigger>("/fast_lio/reset_tracking");
     tracking_sub_ = create_subscription<fast_lio::msg::TrackingStatus>(
         "/fast_lio/tracking_status", rclcpp::QoS(1).reliable().transient_local(),
         [this](fast_lio::msg::TrackingStatus::ConstSharedPtr status) {
             bool invalidate = false;
+            bool new_loss = false;
+            bool backend_changed = false;
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
+                new_loss = status->state == fast_lio::msg::TrackingStatus::LOST &&
+                    (previous_tracking_state_ != status->state || status->generation != tracking_generation_ ||
+                    status->instance_id != tracking_instance_);
                 const bool new_instance = tracking_seen_ && status->instance_id != tracking_instance_;
+                backend_changed = new_instance;
                 if (new_instance && retired_instances_.count(status->instance_id)) return;
                 if (!new_instance && tracking_seen_ && status->generation < tracking_generation_) return;
                 if (new_instance) retired_instances_.insert(tracking_instance_);
@@ -787,6 +895,7 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
                 if (!tracking_seen_ || tracking_generation_ != status->generation || tracking_ready_ != ready)
                     RCLCPP_INFO(get_logger(), "FAST-LIO tracking state=%u generation=%lu reset_pending=%d",
                         status->state, static_cast<unsigned long>(status->generation), bool(reset_pending_));
+                previous_tracking_state_ = status->state;
                 tracking_instance_ = status->instance_id;
                 tracking_seen_ = true;
                 tracking_generation_ = status->generation;
@@ -799,8 +908,19 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
                     if (accepted_tracking_stamps_.size() > 32) accepted_tracking_stamps_.pop_front();
                 }
             }
+            if (backend_changed && runtime_.active) {
+                runtime_.faulted("backend_restarted_during_recovery"); HoldRuntimeFault();
+            }
+            if (!tracking_ready_) runtime_.unavailable();
             if (status->state == fast_lio::msg::TrackingStatus::LOST) {
-                startup_.lost(status->instance_id, status->generation, status->reason, SteadySeconds());
+                if (new_loss && runtime_.active) runtime_.attempt_lost(status->reason, SteadySeconds());
+                else if (new_loss && !startup_.acquiring && have_trusted_body_pose_ &&
+                    runtime_.lost(status->reason, SteadySeconds() - trusted_body_wall_, SteadySeconds())) {
+                    runtime_anchor_ = trusted_body_pose_;
+                }
+                if (!runtime_.active && !runtime_.blocked)
+                    startup_.lost(status->instance_id, status->generation, status->reason, SteadySeconds());
+                HoldRuntimeFault();
             } else if (!tracking_ready_) startup_.unavailable();
             else startup_.waiting("waiting_for_global_registration");
             if (invalidate) {
@@ -847,17 +967,27 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
             ReportResetStatus(2, "backend_reset_unavailable");
             startup_.fault("backend_reset_unavailable");
         }
-        if (startup_.take_retry(SteadySeconds(), reset_inflight_ || reset_failed_ ||
+        if (!runtime_.active && !runtime_.blocked && startup_.take_retry(SteadySeconds(), reset_inflight_ || reset_failed_ ||
             (reset_pending_ && !reset_acknowledged_))) {
             RCLCPP_WARN(get_logger(), "Coordinated startup retry %lu: %s",
                 static_cast<unsigned long>(startup_.retries), startup_.last_failure.c_str());
             BeginReset(acquisition_pose_, true);
         }
+        if (runtime_.active && reset_failed_) runtime_.faulted("backend_reset_failed");
+        if (runtime_.take_attempt(SteadySeconds())) {
+            if (reset_inflight_) runtime_.faulted("backend_reset_still_inflight");
+            else BeginReset(runtime_anchor_, false, true);
+        }
+        HoldRuntimeFault();
         DispatchReset();
         DrainTrackingInputs();
         if (startup_.ready && SteadySeconds() - last_global_output_wall_ > 0.5)
             startup_.unavailable();
+        if (!startup_.ready) runtime_.unavailable();
+        if (runtime_.active && reset_acknowledged_ && !reset_failed_ && runtime_.in_attempt())
+            runtime_.phase = "relocalizing";
         ReportStartup();
+        ReportRuntime();
         bool hold;
         {
             std::lock_guard<std::mutex> lock(lock_state_);
@@ -1201,6 +1331,9 @@ bool GloabalLocalization::GetTfTransformToMatrix(
 
 void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::SharedPtr baselink2odom)
 {
+    if (runtime_.blocked || (runtime_.active &&
+        (!runtime_.in_attempt() || !runtime_.quiet(SteadySeconds())))) return;
+
     {
         std::lock_guard<std::mutex> lock(lock_state_);
         if (!tracking_ready_ || !IsAcceptedTrackingStamp(baselink2odom->header.stamp)) {
@@ -1464,6 +1597,9 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
     // Close acquisition as soon as the required map/body outputs are released.
     // Optional torso output TF must not leave automatic resets armed after Nav2 can start.
     last_global_output_wall_ = SteadySeconds();
+    trusted_body_wall_ = last_global_output_wall_ - std::max(0.0,
+        (now().nanoseconds() - rclcpp::Time(baselink2odom->header.stamp).nanoseconds()) * 1e-9);
+    runtime_.ready(last_global_output_wall_);
     startup_.complete();
     ReportStartup();
 

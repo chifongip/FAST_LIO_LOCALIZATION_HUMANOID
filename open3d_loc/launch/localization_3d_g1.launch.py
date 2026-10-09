@@ -31,7 +31,13 @@ def generate_launch_description():
                 'launch',
                 'open3d_loc_g1.launch.py'
             ])
-        ])
+        ]),
+        # This legacy profile starts FAST-LIO with mid360.yaml (Livox).
+        launch_arguments={
+            'runtime_recovery_enabled': 'false',
+            'recovery_imu_topic': '/livox/imu',
+            'recovery_imu_time_offset_sec': '0.0',
+        }.items(),
     )
 
     # RViz 节点配置

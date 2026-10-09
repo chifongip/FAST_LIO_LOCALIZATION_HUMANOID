@@ -32,6 +32,11 @@ def generate_launch_description():
         )
     )
 
+    runtime_recovery_arg = DeclareLaunchArgument(
+        'runtime_recovery_enabled', default_value='true',
+        description='Enable bounded recovery using final navigation commands and quiet IMU'
+    )
+
     fast_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
             fast_lio_share, 'launch', 'mapping.launch.py'
@@ -53,6 +58,9 @@ def generate_launch_description():
             'map_file': LaunchConfiguration('map_file'),
             'use_sim_time': LaunchConfiguration('use_sim_time'),
             'imu_frame': 'lidar_imu_chest_front',
+            'runtime_recovery_enabled': LaunchConfiguration('runtime_recovery_enabled'),
+            'recovery_imu_topic': '/aima/hal/sensor/lidar_chest_front/imu',
+            'recovery_imu_time_offset_sec': LaunchConfiguration('sensor_time_offset_to_ros_sec'),
             'body_frame': 'base_link',
             'output_frame': 'torso_link',
             # Publish the base pose derived from /Odometry_loc for Navigation2.
@@ -77,6 +85,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         map_file_arg,
+        runtime_recovery_arg,
         use_sim_time_arg,
         start_rviz_arg,
         sensor_time_offset_arg,

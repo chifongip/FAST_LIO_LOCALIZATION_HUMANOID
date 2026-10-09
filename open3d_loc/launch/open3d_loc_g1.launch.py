@@ -1,9 +1,26 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node, SetParameter
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+def recovery_overrides(context):
+    """Override only arguments explicitly supplied by a caller/profile."""
+    result = {}
+    enabled = LaunchConfiguration('runtime_recovery_enabled').perform(context).strip()
+    if enabled:
+        if enabled.lower() not in ('true', 'false'):
+            raise ValueError('runtime_recovery_enabled must be true, false, or empty')
+        result['runtime_recovery.enabled'] = enabled.lower() == 'true'
+    topic = LaunchConfiguration('recovery_imu_topic').perform(context).strip()
+    if topic:
+        result['runtime_recovery.imu_topic'] = topic
+    offset = LaunchConfiguration('recovery_imu_time_offset_sec').perform(context).strip()
+    if offset:
+        result['runtime_recovery.imu_time_offset_sec'] = float(offset)
+    return result
 
 
 def generate_launch_description():
@@ -54,6 +71,19 @@ def generate_launch_description():
         description='Open3D log level: debug, info, warning, or error'
     )
 
+    runtime_recovery_arg = DeclareLaunchArgument(
+        'runtime_recovery_enabled', default_value='',
+        description='Override recovery enablement; empty uses YAML configuration'
+    )
+    recovery_imu_arg = DeclareLaunchArgument(
+        'recovery_imu_topic', default_value='',
+        description='Override raw IMU topic; empty uses YAML configuration'
+    )
+    recovery_offset_arg = DeclareLaunchArgument(
+        'recovery_imu_time_offset_sec', default_value='',
+        description='Override IMU timestamp offset in seconds; empty uses YAML configuration'
+    )
+
     # 配置文件路径
     config_file = PathJoinSubstitution([
         open3d_loc_share,
@@ -85,44 +115,49 @@ def generate_launch_description():
     )
 
     # 全局定位节点
-    global_localization_node = Node(
-        package='open3d_loc',
-        executable='global_localization_node',
-        name='global_localization_node',
-        output='screen',
-        arguments=['--ros-args', '--log-level', 'global_localization_node:=error'],
-        parameters=[
-            config_file,
-            {
-                'path_map': map_file,
-                'pcd_queue_maxsize': 10,
-                'voxelsize_coarse': 0.01,
-                'voxelsize_fine': 0.2,
-                'threshold_fitness': 0.5,
-                'threshold_fitness_init': 0.5,
-                'loc_frequence': 1.0,
-                'save_scan': False,
-                'hidden_removal': False,
-                'maxpoints_source': 80000,
-                'maxpoints_target': 400000,
-                'filter_odom2map': False,
-                'fusion.enabled': True,
-                'fusion.recovery.enabled': True,
-                'kalman_processVar2': 0.001,
-                'kalman_estimatedMeasVar2': 0.02,
-                'confidence_loc_th': 0.7,
-                'dis_updatemap': 3.5,
-                'imu_frame': LaunchConfiguration('imu_frame'),
-                'body_frame': LaunchConfiguration('body_frame'),
-                'output_frame': LaunchConfiguration('output_frame'),
-                'publish_robot_root_tf': LaunchConfiguration('publish_robot_root_tf'),
-                'publish_output_tf': LaunchConfiguration('publish_output_tf'),
-                'tf_lookup_max_age_ms': LaunchConfiguration('tf_lookup_max_age_ms'),
-                'open3d_verbosity': LaunchConfiguration('open3d_verbosity'),
-                'use_sim_time': LaunchConfiguration('use_sim_time')
-            }
-        ]
-    )
+    def create_global_node(context):
+        node = Node(
+            package='open3d_loc',
+            executable='global_localization_node',
+            name='global_localization_node',
+            output='screen',
+            arguments=['--ros-args', '--log-level', 'global_localization_node:=error'],
+            parameters=[
+                config_file,
+                {
+                    'path_map': map_file,
+                    'pcd_queue_maxsize': 10,
+                    'voxelsize_coarse': 0.01,
+                    'voxelsize_fine': 0.2,
+                    'threshold_fitness': 0.5,
+                    'threshold_fitness_init': 0.5,
+                    'loc_frequence': 1.0,
+                    'save_scan': False,
+                    'hidden_removal': False,
+                    'maxpoints_source': 80000,
+                    'maxpoints_target': 400000,
+                    'filter_odom2map': False,
+                    'fusion.enabled': True,
+                    'fusion.recovery.enabled': True,
+                    'kalman_processVar2': 0.001,
+                    'kalman_estimatedMeasVar2': 0.02,
+                    'confidence_loc_th': 0.7,
+                    'dis_updatemap': 3.5,
+                    'imu_frame': LaunchConfiguration('imu_frame'),
+                    'body_frame': LaunchConfiguration('body_frame'),
+                    'output_frame': LaunchConfiguration('output_frame'),
+                    'publish_robot_root_tf': LaunchConfiguration('publish_robot_root_tf'),
+                    'publish_output_tf': LaunchConfiguration('publish_output_tf'),
+                    'tf_lookup_max_age_ms': LaunchConfiguration('tf_lookup_max_age_ms'),
+                    'open3d_verbosity': LaunchConfiguration('open3d_verbosity'),
+                    'use_sim_time': LaunchConfiguration('use_sim_time')
+                },
+                recovery_overrides(context),
+            ]
+        )
+        return [node]
+
+    global_localization_node = OpaqueFunction(function=create_global_node)
 
     # 点云转换节点
     pointcloud_transformer_node = Node(
@@ -147,6 +182,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         use_sim_time_arg,
+        runtime_recovery_arg,
+        recovery_imu_arg,
+        recovery_offset_arg,
         map_file_arg,
         imu_frame_arg,
         body_frame_arg,

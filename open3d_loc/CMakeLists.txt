@@ -191,6 +191,9 @@ if(BUILD_TESTING)
         find_package(ament_cmake_pytest REQUIRED)
         ament_lint_auto_find_test_dependencies()
 
+        ament_add_gtest(test_runtime_recovery test/test_runtime_recovery.cpp)
+        target_include_directories(test_runtime_recovery PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
         ament_add_gtest(test_startup_recovery test/test_startup_recovery.cpp)
         target_include_directories(test_startup_recovery PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -221,7 +224,7 @@ if(BUILD_TESTING)
                 ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
         )
         ament_add_pytest_test(test_tracking_recovery test/test_tracking_recovery.py
-                TIMEOUT 120
+                TIMEOUT 180
                 ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
                     FAST_LIO_EXECUTABLE=${fast_lio_DIR}/../../../lib/fast_lio/fastlio_mapping
         )

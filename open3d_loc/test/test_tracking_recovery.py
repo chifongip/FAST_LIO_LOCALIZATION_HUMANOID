@@ -10,7 +10,7 @@ import pytest
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from fast_lio.msg import TrackingStatus
-from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2, PointField
@@ -21,8 +21,8 @@ from tf2_msgs.msg import TFMessage
 import yaml
 
 
-@pytest.mark.parametrize("imu_reliability", ["best_effort", "reliable"])
-def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_reliability):
+@pytest.mark.parametrize("imu_reliability,runtime_enabled", [("best_effort", False), ("reliable", False), ("best_effort", True)])
+def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_reliability, runtime_enabled):
     monkeypatch.setenv("ROS_DOMAIN_ID", str(170 + os.getpid() % 30))
     monkeypatch.delenv("FASTRTPS_DEFAULT_PROFILES_FILE", raising=False)
     environment = os.environ.copy()
@@ -68,6 +68,15 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
     }
     global_parameters = {
         "path_map": str(map_path),
+        "runtime_recovery.enabled": runtime_enabled,
+        "runtime_recovery.imu_topic": "/test/imu",
+        # The synthetic publisher emits each 100-ms IMU batch in a burst.
+        "runtime_recovery.imu_max_age": 0.2,
+        "runtime_recovery.settle": 0.3,
+        "runtime_recovery.retry_backoff": 0.2,
+        "runtime_recovery.attempt_timeout": 3.0,
+        "runtime_recovery.max_attempts": 2,
+        "runtime_recovery.budget_rearm": 0.5,
         "initialpose": [0.0] * 6,
         "imu_frame": "test_imu",
         "output_frame": "base_link",
@@ -92,6 +101,9 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
         Imu, "/test/imu",
         QoSProfile(depth=1000, reliability=ReliabilityPolicy.RELIABLE),
     )
+    final_pub = node.create_publisher(TwistStamped, "/navigation/final_command", 10)
+    publish_command = True
+    command_speed = 0.0
     tf_pub = node.create_publisher(TFMessage, "/tf", 20)
     publish_joint_tf = False
     global_diagnostics = []
@@ -146,9 +158,13 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
     def stamp(ns):
         return rclpy.time.Time(nanoseconds=ns).to_msg()
 
-    def pump(cloud_points=points, acceleration=(0.0, 0.0, 9.81), publish_imu=True):
+    def pump(cloud_points=points, acceleration=(0.0, 0.0, 9.81), publish_imu=True, invalid_covariance=None):
         nonlocal last_imu_ns
         cycle_started = time.monotonic()
+        if publish_command:
+            command = TwistStamped(header=Header(stamp=node.get_clock().now().to_msg()))
+            command.twist.linear.x = command_speed
+            final_pub.publish(command)
         begin = node.get_clock().now().nanoseconds - 110_000_000
         end = begin + 90_000_000
         if not publish_imu:
@@ -165,6 +181,8 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
                 imu.linear_acceleration.y,
                 imu.linear_acceleration.z,
             ) = acceleration
+            if invalid_covariance:
+                getattr(imu, invalid_covariance + "_covariance")[0] = -1.0
             imu_pub.publish(imu)
             time.sleep(0.001)
         cloud = create_cloud(
@@ -267,7 +285,10 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
         # Cold start with LiDAR before any IMU: retry fresh windows without
         # requiring the operator to reset or changing the external generation.
         deadline = time.monotonic() + 5
-        while not (cloud_pub.get_subscription_count() and imu_pub.get_subscription_count()):
+        while not (cloud_pub.get_subscription_count() and any(
+            endpoint.node_name == "laser_mapping"
+            for endpoint in node.get_subscriptions_info_by_topic("/test/imu")
+        )):
             assert time.monotonic() < deadline
             rclpy.spin_once(node, timeout_sec=0.01)
         expected_reliability = (
@@ -346,6 +367,116 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch, imu_re
         )
         assert statuses[-1].reason == "degenerate_geometry"
         until(lambda: statuses[-1].state == TrackingStatus.TRACKING, timeout=2)
+
+        if runtime_enabled:
+            def runtime_phase():
+                for message in reversed(global_diagnostics):
+                    for entry in message.status:
+                        if entry.name == "open3d_loc/runtime_recovery":
+                            return entry.message
+                return ""
+
+            # A moving command prevents reset, even though the synthetic IMU is quiet.
+            command_speed = 0.1
+            until(lambda: statuses[-1].state == TrackingStatus.LOST,
+                  cloud_points=points[::300])
+            generation = statuses[-1].generation
+            for _ in range(3):
+                pump()
+            assert statuses[-1].generation == generation
+            assert runtime_phase() == "waiting_for_stop"
+            command_speed = 0.0
+            until(lambda: statuses[-1].generation > generation)
+            until(lambda: runtime_phase() == "recovered")
+            assert statuses[-1].state == TrackingStatus.TRACKING
+
+            # After rearming, persistent occlusion exhausts the bounded budget.
+            for _ in range(8):
+                pump()
+            until(lambda: runtime_phase() == "operator_required",
+                  cloud_points=points[::300], timeout=15)
+            generation = statuses[-1].generation
+            held_stamp = localization[-1].header.stamp
+            for _ in range(5):
+                pump()
+            assert statuses[-1].generation == generation
+            assert localization[-1].header.stamp == held_stamp
+            request_pose()
+            until(lambda: runtime_phase() in ("idle", "recovered")
+                  and statuses[-1].generation > generation
+                  and statuses[-1].state == TrackingStatus.TRACKING)
+            # Wait for globally confirmed output before another episode.
+            for _ in range(10):
+                pump()
+
+            # Losing command telemetry during an attempt invalidates late results.
+            generation = statuses[-1].generation
+            until(lambda: statuses[-1].generation > generation,
+                  cloud_points=points[::300])
+            publish_command = False
+            until(lambda: runtime_phase() == "operator_required",
+                  cloud_points=points[::300])
+            assert runtime_phase() == "operator_required"
+            publish_command = True
+            request_pose()
+            until(lambda: statuses[-1].state == TrackingStatus.TRACKING
+                  and runtime_phase() == "idle")
+            for _ in range(10):
+                pump()
+            # ROS IMU fields explicitly marked unavailable cannot qualify recovery.
+            for field in ("angular_velocity", "linear_acceleration"):
+                generation = statuses[-1].generation
+                until(lambda: statuses[-1].generation > generation,
+                      cloud_points=points[::300])
+                until(lambda: runtime_phase() == "operator_required",
+                      cloud_points=points[::300], invalid_covariance=field)
+                request_pose()
+                until(lambda: statuses[-1].state == TrackingStatus.TRACKING
+                      and runtime_phase() == "idle")
+                for _ in range(10):
+                    pump()
+            # An operator pose supersedes an in-flight automatic reset.
+            generation = statuses[-1].generation
+            until(lambda: statuses[-1].generation > generation,
+                  cloud_points=points[::300])
+            generation = statuses[-1].generation
+            request_pose(yaw=0.05)
+            until(lambda: statuses[-1].generation > generation
+                  and statuses[-1].state == TrackingStatus.TRACKING
+                  and runtime_phase() == "idle")
+            for _ in range(10):
+                pump()
+            # Hard timing faults cannot enter automatic reset.
+            generation = statuses[-1].generation
+            stale = Imu(header=Header(stamp=stamp(last_imu_ns - 1_000_000_000)))
+            stale.linear_acceleration.z = 9.81
+            imu_pub.publish(stale)
+            until(lambda: runtime_phase() == "operator_required")
+            for _ in range(3):
+                pump()
+            assert statuses[-1].generation == generation
+            request_pose()
+            until(lambda: statuses[-1].state == TrackingStatus.TRACKING
+                  and runtime_phase() == "idle")
+            for _ in range(10):
+                pump()
+            # An unexpected backend replacement cannot complete an old attempt.
+            generation = statuses[-1].generation
+            until(lambda: statuses[-1].generation > generation,
+                  cloud_points=points[::300])
+            processes[0].send_signal(signal.SIGINT)
+            processes[0].wait(timeout=5)
+            last_imu_ns = 0
+            processes[0] = subprocess.Popen(
+                [os.environ["FAST_LIO_EXECUTABLE"], "--ros-args", "--params-file",
+                 str(tmp_path / "fast.yaml")],
+                stdout=logs[0], stderr=subprocess.STDOUT, env=environment,
+            )
+            until(lambda: runtime_phase() == "operator_required")
+            request_pose()
+            until(lambda: statuses[-1].state == TrackingStatus.TRACKING
+                  and runtime_phase() == "idle")
+            return
 
         # An actual post-start IMU outage stays latched despite fresh data.
         for _ in range(3):

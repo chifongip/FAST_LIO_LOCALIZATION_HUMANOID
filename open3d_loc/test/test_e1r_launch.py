@@ -73,3 +73,68 @@ def test_flat_floor_height_bounds_configuration():
     }
     assert parameters["fusion"]["enabled"] is True
     assert all(parameters["fusion"]["update_mask"])
+
+
+def _generic_launch():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("generic_localization_launch", OPEN3D_LAUNCH_FILE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_recovery_yaml_values_are_not_overridden_by_unspecified_launch_arguments():
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument, OpaqueFunction
+    from launch_ros.utilities import evaluate_parameters
+
+    context = LaunchContext()
+    description = _generic_launch().generate_launch_description()
+    for action in description.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    opaque = next(a for a in description.entities if isinstance(a, OpaqueFunction))
+    node = opaque.execute(context)[0]
+    parameters = evaluate_parameters(context, node._Node__parameters)
+    # Check actual launch parameters: the later dictionaries must not mask YAML.
+    overrides = {k: v for entry in parameters if isinstance(entry, dict) for k, v in entry.items()}
+    assert not any(k.startswith("runtime_recovery.") for k in overrides)
+    yaml_parameters = yaml.safe_load(CONFIG_FILE.read_text())["global_localization_node"]["ros__parameters"]
+    assert yaml_parameters["runtime_recovery"]["imu_topic"] == "/aima/hal/sensor/lidar_chest_front/imu"
+    assert yaml_parameters["runtime_recovery"]["anchor_max_age"] == 10.0
+
+
+def test_explicit_recovery_launch_arguments_have_typed_precedence():
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument, OpaqueFunction
+    from launch_ros.utilities import evaluate_parameters
+
+    context = LaunchContext()
+    context.launch_configurations.update({
+        "runtime_recovery_enabled": "true", "recovery_imu_topic": "/test/imu",
+        "recovery_imu_time_offset_sec": "-0.25",
+    })
+    description = _generic_launch().generate_launch_description()
+    for action in description.entities:
+        if isinstance(action, DeclareLaunchArgument):
+            action.execute(context)
+    opaque = next(a for a in description.entities if isinstance(a, OpaqueFunction))
+    node = opaque.execute(context)[0]
+    parameters = evaluate_parameters(context, node._Node__parameters)
+    assert parameters[-1] == {
+        "runtime_recovery.enabled": True, "runtime_recovery.imu_topic": "/test/imu",
+        "runtime_recovery.imu_time_offset_sec": -0.25,
+    }
+
+
+def test_invalid_recovery_enablement_is_rejected():
+    import pytest
+    from launch import LaunchContext
+
+    context = LaunchContext()
+    context.launch_configurations.update({
+        "runtime_recovery_enabled": "yes", "recovery_imu_topic": "",
+        "recovery_imu_time_offset_sec": "",
+    })
+    with pytest.raises(ValueError):
+        _generic_launch().recovery_overrides(context)

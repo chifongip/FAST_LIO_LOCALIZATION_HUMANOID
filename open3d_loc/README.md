@@ -462,3 +462,76 @@ and maps must stay out of Git. Keep the runtime reliability setting unchanged
 until a simultaneous cold-start capture supports changing it. Hardware rollout
 still requires twenty coordinated stationary cold starts with advancing odometry
 and the complete TF chain; synthetic backend restarts do not replace that check.
+
+
+### Automatic recovery after an operational obstruction
+
+E1R launches enable `runtime_recovery.enabled`; generic launches default it to
+false in the YAML. Generic localization launch arguments for recovery enablement,
+IMU topic, and IMU timestamp offset default to empty, preserving YAML values;
+explicit arguments take precedence. E1R explicitly selects its chest IMU topic
+and shared sensor clock offset. The legacy G1 profile explicitly selects Livox
+and keeps automatic runtime recovery disabled. Set launch argument
+`runtime_recovery_enabled:=false` to disable E1R recovery.
+The coordinator requires a previously trusted global body pose. Brief losses
+still use the existing degraded-tracking recovery without resetting.
+
+After eligible LOST (`prediction_timeout`, `imu_time_gap`,
+`missing_imu_coverage`, or `scan_time_gap`), recovery waits for one second of
+fresh zero final commands and quiet IMU data. The command source is
+`/navigation/final_command` (`geometry_msgs/TwistStamped`), published by the
+navigation ZMQ bridge after successful command submission, including watchdog
+zeros. It is **not robot execution feedback**. External control must stop the
+robot, and no other joystick/controller may override the bridge during recovery.
+This feature does not gate velocity or resume an aborted Nav2 goal.
+
+The last trusted map body pose must be at most three seconds old at the first
+reset. That anchor is frozen for all retries. A full coordinated estimator reset
+is followed by fresh local tracking and three qualifying global registrations
+with required timestamped TF. Historical outputs retain their original stamps
+until recovery succeeds. Existing geometry, residual, motion, and height gates
+remain active; reset is not proof of localization health.
+
+The supplied YAML allows five attempts, three seconds apart, with a 15-second
+limit per attempt and a ten-second anchor-age limit before the first reset.
+The node fallback defaults are three attempts, two seconds apart, and a
+three-second anchor-age limit. Startup retries cannot bypass this budget. Persistent
+obstruction, a backend reset failure, an ineligible fault, or any interruption
+of the quiet/fresh input window after the first attempt requires operator intervention. Use `/initialpose` or
+`/localization/reset_tracking` to supersede automatic recovery. The retry budget
+rearms only after 30 seconds of uninterrupted global readiness.
+
+Monitor `open3d_loc/runtime_recovery` on `/localization_3d_diagnostics`: phase,
+blocker, reason, attempt, command/IMU age, anchor age at loss, and
+operator_required. Phases are disabled, idle, waiting_for_stop, resetting,
+relocalizing, recovered, and operator_required.
+
+All `runtime_recovery.*` parameters are startup-only:
+
+| Parameter | Node fallback default |
+|---|---:|
+| enabled | false (true in E1R launch) |
+| command_topic | /navigation/final_command |
+| imu_topic | /livox/imu (E1R uses the FAST-LIO E1R topic) |
+| imu_time_offset_sec | 0.0 (E1R shares sensor_time_offset_to_ros_sec) |
+| settle | 1.0 s |
+| command_max_age | 0.20 s |
+| imu_max_age | 0.05 s (also maximum sample interval) |
+| linear_limit | 0.01 m/s |
+| angular_limit | 0.01 rad/s |
+| gyro_limit | 0.05 rad/s |
+| gravity_tolerance | 0.5 m/s² from magnitude 9.81 |
+| acceleration_rms | 0.20 m/s² vector variation about window mean |
+| anchor_max_age | 3.0 s at first reset |
+| max_attempts | 3 |
+| retry_backoff | 2.0 s |
+| attempt_timeout | 15.0 s |
+| budget_rearm | 30.0 s |
+
+IMU thresholds are provisional: validate them using stationary humanoid balancing
+samples before hardware operation. Unavailable IMU acceleration/gyro fields,
+duplicate/regressing stamps, missing data, multiple input publishers, and invalid values cannot establish a quiet window.
+Raw acceleration includes gravity; near-zero acceleration is not the expected
+standstill measurement. Zero commands plus a quiet IMU cannot detect constant
+velocity, sliding, or movement through an independent control path. Local ICP
+must still converge near the trusted pose; broad map relocalization is not added.
