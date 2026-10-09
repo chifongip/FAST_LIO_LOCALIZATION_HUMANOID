@@ -71,3 +71,14 @@ TEST(TrackingGuard, BoundsPredictionBeforeFirstAcceptedUpdate)
   EXPECT_FALSE(guard.allowPrediction(2.8));
   EXPECT_EQ(guard.reason, "prediction_timeout");
 }
+
+TEST(TrackingGuard, PreservesFirstFailureUntilReset)
+{
+  fast_lio::TrackingGuard guard;
+  guard.lose("imu_time_gap");
+  guard.lose("prediction_timeout");
+  EXPECT_EQ(guard.reason, "imu_time_gap");
+  guard.reset();
+  guard.lose("timestamp_regression");
+  EXPECT_EQ(guard.reason, "timestamp_regression");
+}

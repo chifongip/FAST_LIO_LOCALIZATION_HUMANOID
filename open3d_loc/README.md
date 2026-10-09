@@ -331,12 +331,19 @@ An independently restarted or reset backend also invalidates global initializati
 fresh global poses remain held until three new global registrations succeed.
 Initialization confirmation timestamps restart with each generation, allowing
 recovery when sensor time restarts at an earlier value.
-Stationary constraints and automatic full resets are not enabled.
+Stationary constraints are not enabled. After the first trusted local pose,
+tracking loss remains latched until a coordinated reset. Before that first pose
+(including after an operator reset), incomplete IMU startup windows are retried
+automatically without changing the external reset generation. Invalid IMU values,
+timestamp regression, and buffer overflow remain latched failures.
 
 The new FAST-LIO protection parameters are startup-only and default to:
 
 ```yaml
 tracking:
+  imu_queue_depth: 200
+  sync_wait_timeout: 0.1
+  startup_warning_timeout: 10.0
   min_features: 100
   min_feature_ratio: 0.2
   max_residual_rms: 0.15
@@ -352,3 +359,36 @@ Pose-change guards include tolerances of 0.1 m and 0.1 rad. Rotational Jacobian
 columns are normalized by scan radius before checking observability. Validate
 these new limits with recorded healthy and obstructed scans before hardware
 rollout; existing maps, extrinsics, noise values, and height settings are unchanged.
+
+IMU reception uses a dedicated callback group, executor, and thread. Its DDS
+subscription remains best effort and volatile; `imu_queue_depth` controls the
+keep-last depth (1–2000). LiDAR preprocessing and estimation run serially on the
+main executor, without holding the IMU buffer mutex during preprocessing or
+estimation. Increasing DDS depth alone cannot correct estimator synchronization
+or an actual missing interval.
+
+A scan is consumed only after IMU timestamps cover its end and the integration
+boundary with no gap exceeding `max_imu_gap`. A pending scan waits up to
+`sync_wait_timeout` measured with the steady clock for IMU arrival. A covered
+scan interval containing no new IMU samples is skipped without advancing the
+estimator or consuming the retained IMU data. Startup requires a continuous
+200 ms IMU window before initialization. Failed unpublished initialization
+windows reset the IMU processor, EKF, and local map and retry fresh sensor data.
+`startup_warning_timeout` raises the diagnostic level to ERROR while retries
+continue; it does not authorize unvalidated odometry. All three settings are
+startup-only. Existing tuned YAML values are preserved.
+
+`/fast_lio/diagnostics` includes the startup retry count, scan and IMU boundary
+timestamps, synchronization reason and wait, batch size, queue depth/high-water
+mark, latest timestamp/arrival gaps, and processing duration. On LOST, diagnostic
+values freeze at the first failure until reset, and a detailed loss log is
+emitted once. The tracking reason also preserves the first failure. Automatic
+startup retries do not replace the operator reset procedure after trusted
+tracking has begun.
+
+Validate cold starts with the robot stationary before rollout: require 20
+consecutive successful starts with fresh local odometry, global localization,
+and the complete `map -> odom -> base_link` TF chain. Confirm that a genuine
+post-start IMU outage latches LOST and that `/initialpose` performs a coordinated
+reset and recovery. Local synthetic tests run in separate ROS domains and do
+not restart or command a connected robot.

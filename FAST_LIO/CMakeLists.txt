@@ -144,6 +144,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_e1r_preprocess ${PCL_LIBRARIES} Eigen3::Eigen)
   ament_target_dependencies(test_e1r_preprocess ${dependencies})
 
+  ament_add_gtest(test_imu_sync test/test_imu_sync.cpp)
+  target_include_directories(test_imu_sync PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+  ament_add_gtest(test_imu_receiver test/test_imu_receiver.cpp
+    ENV ROS_DOMAIN_ID=213)
+  target_include_directories(test_imu_receiver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  ament_target_dependencies(test_imu_receiver rclcpp sensor_msgs)
+
   ament_add_gtest(test_tracking_guard test/test_tracking_guard.cpp)
   target_include_directories(test_tracking_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(test_tracking_guard Eigen3::Eigen)

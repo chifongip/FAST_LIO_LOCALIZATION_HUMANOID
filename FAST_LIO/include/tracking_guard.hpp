@@ -103,6 +103,7 @@ public:
   }
   void lose(const std::string & why)
   {
+    if (state == LOST) return;
     state = LOST;
     confirmations = 0;
     reason = why;

@@ -8,6 +8,7 @@ import time
 
 import pytest
 import rclpy
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from fast_lio.msg import TrackingStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
@@ -38,6 +39,7 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         + "".join(f"{x} {y} {z}\n" for x, y, z in points)
     )
     fast_parameters = {
+        "tracking.startup_warning_timeout": 0.2,
         "common.lid_topic": "/test/lidar",
         "common.imu_topic": "/test/imu",
         "preprocess.lidar_type": 5,
@@ -119,17 +121,24 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
     processes, logs = [], []
     last_imu_ns = 0
 
+    diagnostics = []
+    node.create_subscription(
+        DiagnosticArray, "/fast_lio/diagnostics", diagnostics.append, 20
+    )
+
     def stamp(ns):
         return rclpy.time.Time(nanoseconds=ns).to_msg()
 
-    def pump(cloud_points=points, acceleration=(0.0, 0.0, 9.81)):
+    def pump(cloud_points=points, acceleration=(0.0, 0.0, 9.81), publish_imu=True):
         nonlocal last_imu_ns
         cycle_started = time.monotonic()
         begin = node.get_clock().now().nanoseconds - 110_000_000
         end = begin + 90_000_000
-        if not last_imu_ns:
+        if not publish_imu:
+            last_imu_ns = 0
+        if not last_imu_ns and publish_imu:
             last_imu_ns = begin - 5_000_000
-        while last_imu_ns < end + 5_000_000:
+        while publish_imu and last_imu_ns < end + 5_000_000:
             last_imu_ns += 5_000_000
             imu = Imu(
                 header=Header(stamp=stamp(last_imu_ns), frame_id="base_link")
@@ -226,9 +235,34 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
                     env=environment,
                 )
             )
+        # Cold start with LiDAR before any IMU: retry fresh windows without
+        # requiring the operator to reset or changing the external generation.
+        deadline = time.monotonic() + 5
+        while not (cloud_pub.get_subscription_count() and imu_pub.get_subscription_count()):
+            assert time.monotonic() < deadline
+            rclpy.spin_once(node, timeout_sec=0.01)
+        for _ in range(5):
+            pump(publish_imu=False)
+        # Volatile diagnostics discovery can lag the sensor subscriptions.
+        until(
+            lambda: any(
+                entry.level == DiagnosticStatus.ERROR
+                and entry.message == "startup_wait_timeout"
+                for message in diagnostics for entry in message.status
+            ),
+            timeout=5,
+            publish_imu=False,
+        )
+        assert not odometry
         until(
             lambda: localization
             and statuses[-1].state == TrackingStatus.TRACKING
+        )
+        assert statuses[-1].generation == 0
+        assert any(
+            float(value.value) >= 1
+            for message in diagnostics for entry in message.status
+            for value in entry.values if value.key == "startup_retries"
         )
         good_generation = statuses[-1].generation
         good_position = odometry[-1].pose.pose.position
@@ -250,6 +284,24 @@ def test_obstruction_loss_and_initialpose_recovery(tmp_path, monkeypatch):
         assert statuses[-1].state == TrackingStatus.DEGRADED
         assert statuses[-1].reason == "degenerate_geometry"
         until(lambda: statuses[-1].state == TrackingStatus.TRACKING, timeout=2)
+
+        # An actual post-start IMU outage stays latched despite fresh data.
+        for _ in range(3):
+            pump(publish_imu=False)
+        until(lambda: statuses[-1].state == TrackingStatus.LOST)
+        assert statuses[-1].reason in ("missing_imu_coverage", "imu_time_gap")
+        lost_values = diagnostics[-1].status[0].values
+        for _ in range(3):
+            pump()
+        assert statuses[-1].state == TrackingStatus.LOST
+        assert diagnostics[-1].status[0].values == lost_values
+        generation = statuses[-1].generation
+        request_pose()
+        until(
+            lambda: statuses[-1].generation > generation
+            and statuses[-1].state == TrackingStatus.TRACKING
+        )
+        good_generation = statuses[-1].generation
 
         # Prolonged loss holds the last accepted output, including timestamp.
         until(

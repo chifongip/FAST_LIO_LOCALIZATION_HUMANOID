@@ -64,6 +64,9 @@
 // #include <livox_interfaces/msg/custom_msg.hpp>
 #include "odometry_utils.hpp"
 #include "tracking_guard.hpp"
+#include "imu_receiver.hpp"
+#include "imu_sync.hpp"
+#include <atomic>
 #include <fast_lio/msg/tracking_status.hpp>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
@@ -103,7 +106,8 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
-int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
+int effct_feat_num = 0, time_log_counter = 0, scan_count = 0;
+std::atomic<int> publish_count{0};
 int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool point_selected_surf[100000] = {0};
 bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
@@ -136,6 +140,14 @@ fast_lio::TrackingGuard tracking;
 bool measurement_valid = true;
 std::string measurement_reason;
 std::string timing_fault;
+std::uint64_t sensor_epoch = 0;
+std::size_t imu_queue_high_water = 0;
+double received_imu_gap = 0.0, received_arrival_gap = 0.0;
+std::chrono::steady_clock::time_point last_imu_arrival;
+fast_lio::ImuCoverage sync_coverage;
+double sync_previous_imu = -1.0, sync_wait_timeout = 0.1, sync_wait_elapsed = 0.0;
+bool startup_imu_ready = false;
+std::chrono::steady_clock::time_point sync_wait_started;
 double measurement_rms = 0.0, measurement_information_ratio = 0.0;
 sensor_msgs::msg::PointCloud2 held_world_cloud, held_body_cloud;
 geometry_msgs::msg::TransformStamped held_transform;
@@ -341,28 +353,27 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
                              source_timestamp + sensor_time_offset_to_ros_sec);
         return;
     }
+    const double preprocess_start_time = omp_get_wtime();
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    if (!p_pre->process(msg, ptr))
+    {
+        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
+                             "Dropping LiDAR message with an invalid schema, timing, or no usable points");
+        return;
+    }
     mtx_buffer.lock();
     if (scan_count < MAXN - 1) ++scan_count;
-    double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time <= last_timestamp_lidar)
     {
         timing_fault = "timestamp_regression";
         std::cerr << "sensor timestamp regression" << std::endl;
-        lidar_buffer.clear();
+        lidar_buffer.clear(); time_buffer.clear(); lidar_pushed = false;
     }
     if (is_first_lidar)
     {
         is_first_lidar = false;
     }
 
-    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
-    if (!p_pre->process(msg, ptr))
-    {
-        mtx_buffer.unlock();
-        RCLCPP_WARN_THROTTLE(rclcpp::get_logger("fastlio_mapping"), diagnostic_clock(), 2000,
-                             "Dropping LiDAR message with an invalid schema, timing, or no usable points");
-        return;
-    }
     if (lidar_buffer.size() >= 50) {
         timing_fault = "lidar_buffer_overflow";
         lidar_buffer.clear(); time_buffer.clear(); lidar_pushed = false;
@@ -389,14 +400,16 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
                              source_timestamp + sensor_time_offset_to_ros_sec);
         return;
     }
+    const double preprocess_start_time = omp_get_wtime();
+    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
+    p_pre->process(msg, ptr);
     mtx_buffer.lock();
-    double preprocess_start_time = omp_get_wtime();
     if (scan_count < MAXN - 1) ++scan_count;
     if (!is_first_lidar && cur_time <= last_timestamp_lidar)
     {
         timing_fault = "timestamp_regression";
         std::cerr << "sensor timestamp regression" << std::endl;
-        lidar_buffer.clear();
+        lidar_buffer.clear(); time_buffer.clear(); lidar_pushed = false;
     }
     if (is_first_lidar)
     {
@@ -416,8 +429,6 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
-    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
     if (lidar_buffer.size() >= 50) {
         timing_fault = "lidar_buffer_overflow";
         lidar_buffer.clear(); time_buffer.clear(); lidar_pushed = false;
@@ -432,7 +443,13 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
-    publish_count++;
+    std::uint64_t epoch;
+    double alignment;
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        epoch = sensor_epoch;
+        alignment = timediff_lidar_wrt_imu;
+    }
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
 
@@ -444,9 +461,9 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     }
     const double source_timestamp = get_time_sec(msg_in->header.stamp);
     double corrected_timestamp = source_timestamp - time_diff_lidar_to_imu;
-    if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
+    if (abs(alignment) > 0.1 && time_sync_en)
     {
-        corrected_timestamp = timediff_lidar_wrt_imu + source_timestamp;
+        corrected_timestamp = alignment + source_timestamp;
     }
     double ros_timestamp = 0.0;
     if (!try_apply_time_offset(
@@ -468,12 +485,20 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
         !V3D(msg->angular_velocity.x, msg->angular_velocity.y,
             msg->angular_velocity.z).allFinite())
     {
-        timing_fault = "nonfinite_imu";
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+        if (epoch == sensor_epoch) timing_fault = "nonfinite_imu";
         return;
     }
     double timestamp = get_time_sec(msg->header.stamp);
 
-    mtx_buffer.lock();
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (epoch != sensor_epoch) return;
+    ++publish_count;
+    const auto arrival = std::chrono::steady_clock::now();
+    received_arrival_gap = last_timestamp_imu >= 0.0 ?
+        std::chrono::duration<double>(arrival - last_imu_arrival).count() : 0.0;
+    received_imu_gap = last_timestamp_imu >= 0.0 ? timestamp - last_timestamp_imu : 0.0;
+    last_imu_arrival = arrival;
 
     if (last_timestamp_imu >= 0.0 && timestamp <= last_timestamp_imu)
     {
@@ -489,7 +514,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
         imu_buffer.clear();
     }
     imu_buffer.push_back(msg);
-    mtx_buffer.unlock();
+    imu_queue_high_water = std::max(imu_queue_high_water, imu_buffer.size());
     sig_buffer.notify_all();
 }
 
@@ -497,7 +522,8 @@ double lidar_mean_scantime = 0.0;
 int scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
-    if (lidar_buffer.empty() || imu_buffer.empty())
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (lidar_buffer.empty())
     {
         return false;
     }
@@ -559,11 +585,33 @@ bool sync_packages(MeasureGroup &meas)
         meas.lidar_end_time = lidar_end_time;
 
         lidar_pushed = true;
+        sync_wait_started = std::chrono::steady_clock::now();
     }
 
-    if (last_timestamp_imu < lidar_end_time)
-    {
+    sync_wait_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - sync_wait_started).count();
+    std::vector<double> stamps;
+    stamps.reserve(imu_buffer.size());
+    for (const auto & imu : imu_buffer) stamps.push_back(get_time_sec(imu->header.stamp));
+    sync_coverage = fast_lio::imuCoverage(stamps, meas.lidar_beg_time, lidar_end_time,
+        sync_previous_imu, tracking.limits.max_imu_gap, sync_wait_elapsed,
+        sync_wait_timeout, !startup_imu_ready);
+    if (sync_coverage.action == fast_lio::ImuSyncAction::WAITING) return false;
+    if (sync_coverage.action == fast_lio::ImuSyncAction::INVALID) {
+        // Keep the established public reason for end-of-scan/arrival coverage failures.
+        tracking.lose(sync_coverage.reason == "imu_arrival_timeout" ||
+            sync_coverage.reason == "imu_scan_end_gap" ? "missing_imu_coverage" : sync_coverage.reason);
         return false;
+    }
+    if (sync_coverage.action == fast_lio::ImuSyncAction::SKIP_SCAN) {
+        lidar_buffer.pop_front(); time_buffer.pop_front(); lidar_pushed = false;
+        return false;
+    }
+    if (!startup_imu_ready) {
+        while (!imu_buffer.empty() &&
+            get_time_sec(imu_buffer.front()->header.stamp) < sync_coverage.first)
+            imu_buffer.pop_front();
+        startup_imu_ready = true;
     }
 
     /*** push imu data, and pop from imu buffer ***/
@@ -603,6 +651,7 @@ bool sync_packages(MeasureGroup &meas)
         }
     }
 
+    sync_previous_imu = get_time_sec(meas.imu.back()->header.stamp);
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
@@ -1035,6 +1084,13 @@ public:
         rcl_interfaces::msg::ParameterDescriptor tracking_descriptor;
         tracking_descriptor.read_only = true;
         tracking_descriptor.description = "Startup-only tracking protection limit";
+        const int imu_queue_depth = declare_parameter<int>("tracking.imu_queue_depth", 200, tracking_descriptor);
+        sync_wait_timeout = declare_parameter<double>("tracking.sync_wait_timeout", 0.1, tracking_descriptor);
+        startup_warning_timeout_ = declare_parameter<double>("tracking.startup_warning_timeout", 10.0, tracking_descriptor);
+        if (imu_queue_depth <= 0 || imu_queue_depth > 2000 ||
+            !std::isfinite(sync_wait_timeout) || sync_wait_timeout <= 0.0 ||
+            !std::isfinite(startup_warning_timeout_) || startup_warning_timeout_ <= 0.0)
+            throw std::invalid_argument("invalid IMU queue or startup synchronization limits");
         tracking.limits.min_features = declare_parameter<int>("tracking.min_features", 100, tracking_descriptor);
         tracking.limits.min_feature_ratio = declare_parameter<double>("tracking.min_feature_ratio", 0.2, tracking_descriptor);
         tracking.limits.max_residual = declare_parameter<double>("tracking.max_residual_rms", 0.15, tracking_descriptor);
@@ -1044,6 +1100,8 @@ public:
         tracking.limits.max_speed = declare_parameter<double>("tracking.max_speed", 3.0, tracking_descriptor);
         tracking.limits.max_angular_speed = declare_parameter<double>("tracking.max_angular_speed", 3.0, tracking_descriptor);
         tracking.limits.validate();
+        if (sync_wait_timeout > tracking.limits.prediction_timeout)
+            throw std::invalid_argument("sync_wait_timeout must not exceed prediction_timeout");
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -1193,7 +1251,7 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::SensorDataQoS(), imu_cbk);
+        imu_receiver_ = std::make_unique<fast_lio::ImuReceiver>(*this, imu_topic, imu_queue_depth, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_1", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body_1", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected_1", 20);
@@ -1229,6 +1287,7 @@ public:
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - last_accepted_wall_).count()
                     >= tracking.limits.prediction_timeout)
                 tracking.lose(tracking.accepted_stamp >= 0.0 ? "prediction_timeout" : "initialization_timeout");
+            retry_startup();
             publish_tracking();
             if (tracking.state != fast_lio::TrackingGuard::TRACKING) publish_held();
         });
@@ -1238,6 +1297,7 @@ public:
 
     ~LaserMappingNode()
     {
+        if (imu_receiver_) imu_receiver_->stop();
         fout_out.close();
         fout_pre.close();
         if (fp) fclose(fp);
@@ -1263,6 +1323,9 @@ private:
 
     void publish_tracking()
     {
+        retry_startup();
+        if (processing_scan_) processing_duration_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - processing_started_).count();
         fast_lio::msg::TrackingStatus status;
         status.header.stamp = now();
         status.state = tracking.state;
@@ -1304,6 +1367,44 @@ private:
             add("gravity_" + std::to_string(axis), state_point.grav[axis]);
         }
         add("last_imu_gap", last_imu_gap_);
+        const double startup_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - startup_started_).count();
+        if (tracking.accepted_stamp < 0.0 && startup_elapsed >= startup_warning_timeout_) {
+            entry.level = 2;
+            if (tracking.state != fast_lio::TrackingGuard::LOST) entry.message = "startup_wait_timeout";
+        }
+        add("startup_elapsed", startup_elapsed);
+        add("startup_retries", startup_retries_);
+        add("processing_duration", processing_duration_);
+        add("sync_wait", sync_wait_elapsed);
+        add("scan_begin", Measures.lidar_beg_time);
+        add("scan_end", lidar_end_time);
+        add("imu_batch_size", Measures.imu.size());
+        add("imu_first", sync_coverage.first);
+        add("imu_last", sync_coverage.last);
+        add("imu_following", sync_coverage.following);
+        add("imu_end_gap", sync_coverage.end_gap);
+        add("imu_coverage_gap", sync_coverage.gap);
+        diagnostic_msgs::msg::KeyValue sync_reason;
+        sync_reason.key = "sync_reason"; sync_reason.value = sync_coverage.reason;
+        entry.values.push_back(sync_reason);
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            add("imu_queue_size", imu_buffer.size());
+            add("imu_queue_high_water", imu_queue_high_water);
+            add("received_imu_gap", received_imu_gap);
+            add("received_arrival_gap", received_arrival_gap);
+        }
+        if (tracking.state == fast_lio::TrackingGuard::LOST) {
+            if (!lost_reported_) {
+                fault_snapshot_ = entry.values;
+                RCLCPP_ERROR(get_logger(), "Tracking LOST: %s; sync=%s scan_end=%.9f last=%.9f following=%.9f wait=%.3f processing=%.3f",
+                    tracking.reason.c_str(), sync_coverage.reason.c_str(), lidar_end_time,
+                    sync_coverage.last, sync_coverage.following, sync_wait_elapsed, processing_duration_);
+                lost_reported_ = true;
+            }
+            entry.values = fault_snapshot_;
+        }
         diagnostics.status.push_back(entry);
         diagnostics_pub_->publish(diagnostics);
     }
@@ -1318,20 +1419,32 @@ private:
             pubLaserCloudFull_body_->publish(held_body_cloud);
     }
 
-    void reset_tracking()
+    void reset_tracking(bool external = true)
     {
-        // All callbacks use the default mutually-exclusive callback group.
-        std::lock_guard<std::mutex> lock(mtx_buffer);
-        lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear();
-        lidar_pushed = false;
-        last_timestamp_lidar = 0.0; last_timestamp_imu = -1.0;
-        is_first_lidar = true; flg_first_scan = true; flg_EKF_inited = false;
-        lidar_end_time = 0.0; first_lidar_time = 0.0;
-        lidar_mean_scantime = 0.0; scan_num = 0; scan_count = 0; publish_count = 0;
-        time_log_counter = 0; frame_num = 0; position_last = Zero3d;
-        timediff_set_flg = false; timediff_lidar_wrt_imu = 0.0;
-        timing_fault.clear(); last_batch_end_ = -1.0; last_batch_imu_ = -1.0;
-        tracking.reset(); ++generation_; have_accepted_state_ = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            ++sensor_epoch;
+            lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear();
+            lidar_pushed = false;
+            last_timestamp_lidar = 0.0; last_timestamp_imu = -1.0;
+            is_first_lidar = true; flg_first_scan = true; flg_EKF_inited = false;
+            lidar_end_time = 0.0; first_lidar_time = 0.0;
+            lidar_mean_scantime = 0.0; scan_num = 0; scan_count = 0; publish_count = 0;
+            time_log_counter = 0; frame_num = 0; position_last = Zero3d;
+            timediff_set_flg = false; timediff_lidar_wrt_imu = 0.0;
+            timing_fault.clear();
+            imu_queue_high_water = 0; received_imu_gap = 0.0; received_arrival_gap = 0.0;
+            startup_imu_ready = false; sync_previous_imu = -1.0;
+            sync_coverage = fast_lio::ImuCoverage(); sync_wait_elapsed = 0.0;
+        }
+        last_batch_end_ = -1.0; last_batch_imu_ = -1.0;
+        tracking.reset(); have_accepted_state_ = false;
+        if (external) {
+            ++generation_; startup_retries_ = 0;
+            startup_started_ = std::chrono::steady_clock::now();
+        }
+        last_accepted_wall_ = std::chrono::steady_clock::now();
+        fault_snapshot_.clear(); lost_reported_ = false;
         p_imu->Reset();
         state_ikfom fresh;
         fresh.offset_T_L_I = Lidar_T_wrt_IMU;
@@ -1354,7 +1467,10 @@ private:
 
     bool validate_batch()
     {
-        if (!timing_fault.empty()) {tracking.lose(timing_fault); return false;}
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            if (!timing_fault.empty()) {tracking.lose(timing_fault); return false;}
+        }
         if (Measures.imu.empty()) {tracking.lose("missing_imu_coverage"); return false;}
         if (last_batch_end_ >= 0.0 && (Measures.lidar_end_time <= last_batch_end_ ||
             Measures.lidar_end_time - last_batch_end_ > tracking.limits.prediction_timeout)) {
@@ -1379,10 +1495,37 @@ private:
         return tracking.allowPrediction(Measures.lidar_end_time);
     }
 
+    void retry_startup()
+    {
+        if (tracking.accepted_stamp >= 0.0 || tracking.state != fast_lio::TrackingGuard::LOST) return;
+        const auto reason = tracking.reason;
+        if (reason != "missing_imu_coverage" && reason != "imu_time_gap" &&
+            reason != "scan_time_gap" && reason != "initialization_timeout") return;
+        ++startup_retries_;
+        RCLCPP_WARN(get_logger(), "Retrying unpublished startup window (%lu): %s; sync=%s",
+            static_cast<unsigned long>(startup_retries_), reason.c_str(), sync_coverage.reason.c_str());
+        reset_tracking(false);
+    }
+
     void timer_callback()
     {
-        if (!timing_fault.empty()) tracking.lose(timing_fault);
+        processing_scan_ = false;
+        process_scan();
+        if (processing_scan_) processing_duration_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - processing_started_).count();
+        processing_scan_ = false;
+        retry_startup();
+        if (tracking.state == fast_lio::TrackingGuard::LOST) publish_tracking();
+    }
+
+    void process_scan()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer);
+            if (!timing_fault.empty()) tracking.lose(timing_fault);
+        }
         if (tracking.state == fast_lio::TrackingGuard::LOST) {
+            if (tracking.accepted_stamp >= 0.0) publish_tracking();
             // Bound buffers while keeping the lost state latched.
             std::lock_guard<std::mutex> lock(mtx_buffer);
             lidar_buffer.clear(); time_buffer.clear(); imu_buffer.clear(); lidar_pushed = false;
@@ -1390,6 +1533,8 @@ private:
         }
         if (sync_packages(Measures))
         {
+            processing_scan_ = true;
+            processing_started_ = std::chrono::steady_clock::now();
             if (!validate_batch()) {publish_tracking(); return;}
             if (flg_first_scan)
             {
@@ -1532,6 +1677,10 @@ private:
                 kf.change_x(predicted_state); kf.change_P(predicted_covariance);
                 state_point = predicted_state; tracking.lose("implausible_state"); publish_tracking(); return;
             }
+            {
+                std::lock_guard<std::mutex> lock(mtx_buffer);
+                if (!timing_fault.empty()) tracking.lose(timing_fault);
+            }
             if (!tracking.accept(Measures.lidar_end_time)) {publish_tracking(); return;}
             accepted_state_ = state_point; accepted_state_stamp_ = Measures.lidar_end_time;
             have_accepted_state_ = true; last_accepted_wall_ = std::chrono::steady_clock::now();
@@ -1626,7 +1775,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
-    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    std::unique_ptr<fast_lio::ImuReceiver> imu_receiver_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     // rclcpp::Subscription<livox_interfaces::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -1646,6 +1795,13 @@ private:
     double last_batch_end_ = -1.0, last_batch_imu_ = -1.0, last_imu_gap_ = 0.0;
     state_ikfom accepted_state_;
     bool have_accepted_state_ = false;
+    bool processing_scan_ = false;
+    std::chrono::steady_clock::time_point processing_started_;
+    double startup_warning_timeout_ = 10.0, processing_duration_ = 0.0;
+    std::uint64_t startup_retries_ = 0;
+    std::chrono::steady_clock::time_point startup_started_ = std::chrono::steady_clock::now();
+    bool lost_reported_ = false;
+    std::vector<diagnostic_msgs::msg::KeyValue> fault_snapshot_;
     double accepted_state_stamp_ = -1.0;
     std::chrono::steady_clock::time_point last_accepted_wall_;
     bool effect_pub_en = false, map_pub_en = false;
