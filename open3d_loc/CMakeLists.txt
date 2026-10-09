@@ -15,6 +15,8 @@ set(CMAKE_BUILD_TYPE "Release")
 # Find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(fast_lio REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -135,6 +137,8 @@ target_link_libraries(global_localization_node
         global_correction_filter
 )
 ament_target_dependencies(global_localization_node
+        fast_lio
+        std_srvs
         rclcpp
         rcl_interfaces
         std_msgs
@@ -191,6 +195,10 @@ if(BUILD_TESTING)
         )
         target_link_libraries(test_transform_utils Eigen3::Eigen)
 
+        ament_add_gtest(test_registration_geometry test/test_registration_geometry.cpp)
+        ament_target_dependencies(test_registration_geometry fast_lio)
+        target_link_libraries(test_registration_geometry ${Open3D_LIBRARIES} Eigen3::Eigen)
+
         ament_add_gtest(test_global_correction_filter test/test_global_correction_filter.cpp)
         target_include_directories(test_global_correction_filter PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -201,6 +209,11 @@ if(BUILD_TESTING)
         ament_add_pytest_test(test_height_bounds test/test_height_bounds.py
                 TIMEOUT 120
                 ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
+        )
+        ament_add_pytest_test(test_tracking_recovery test/test_tracking_recovery.py
+                TIMEOUT 120
+                ENV GLOBAL_LOCALIZATION_EXECUTABLE=$<TARGET_FILE:global_localization_node>
+                    FAST_LIO_EXECUTABLE=${fast_lio_DIR}/../../../lib/fast_lio/fastlio_mapping
         )
         ament_add_pytest_test(test_registration_reset test/test_registration_reset.py
                 TIMEOUT 120

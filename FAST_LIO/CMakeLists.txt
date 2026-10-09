@@ -50,11 +50,14 @@ find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
@@ -68,11 +71,13 @@ find_package(rosidl_default_generators REQUIRED)
 
 set(dependencies
   rclcpp
+  rcl_interfaces
   rclcpp_components
   geometry_msgs
   nav_msgs
   sensor_msgs
   std_msgs
+  diagnostic_msgs
   std_srvs
   visualization_msgs
   pcl_ros
@@ -93,10 +98,12 @@ message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
 
 set(msg_files
   "msg/Pose6D.msg"
+  "msg/TrackingStatus.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
+  DEPENDENCIES std_msgs builtin_interfaces
 )
 ament_export_dependencies(rosidl_default_runtime)
 
@@ -137,6 +144,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_e1r_preprocess ${PCL_LIBRARIES} Eigen3::Eigen)
   ament_target_dependencies(test_e1r_preprocess ${dependencies})
 
+  ament_add_gtest(test_tracking_guard test/test_tracking_guard.cpp)
+  target_include_directories(test_tracking_guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_tracking_guard Eigen3::Eigen)
+
   ament_add_gtest(test_time_utils test/test_time_utils.cpp)
   target_include_directories(test_time_utils PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -156,6 +167,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_odometry_utils Eigen3::Eigen)
 endif()
 
+install(FILES include/tracking_guard.hpp DESTINATION include/fast_lio/fast_lio)
+ament_export_include_directories(include/fast_lio)
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}

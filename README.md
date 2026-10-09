@@ -270,7 +270,11 @@ The authoritative filtered correction is published on `/odom2map` and TF.
 the fused pose covariance, and `/localization_3d_diagnostics` reports acceptance
 or rejection reasons. Repeated rejected measurements hold the last valid global
 correction and report a degraded state; use `/initialpose` to recover from a
-lost or incorrect global hypothesis.
+lost or incorrect global hypothesis. Every valid `/initialpose` now resets
+FAST-LIO and its local map before global relocalization, including during healthy
+tracking. During tracking loss the stack republishes historical data with its
+original timestamps. See the [tracking-loss and reset guide](open3d_loc/README.md#fast-lio-tracking-loss-and-full-pose-reset)
+for status topics, protection limits, and reset-service behavior.
 
 When recovery is enabled, quality-valid ICP candidates rejected only by the
 translation, rotation, or Mahalanobis gates enter a confirmation stage. Two

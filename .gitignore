@@ -1,3 +1,6 @@
 # Keep bulky documentation media in release assets or external hosting.
 /doc/*.gif
 /doc/*.mp4
+
+# Python test/import caches.
+__pycache__/

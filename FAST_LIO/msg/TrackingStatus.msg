@@ -1,0 +1,14 @@
+uint8 INITIALIZING=0
+uint8 TRACKING=1
+uint8 DEGRADED=2
+uint8 LOST=3
+std_msgs/Header header
+uint8 state
+uint64 instance_id
+uint64 generation
+builtin_interfaces/Time last_accepted_stamp
+string reason
+uint32 effective_features
+float64 residual_rms
+float64 information_ratio
+float64 prediction_interval

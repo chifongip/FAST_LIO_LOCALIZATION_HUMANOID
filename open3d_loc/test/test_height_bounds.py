@@ -9,7 +9,7 @@ import time
 import pytest
 import rclpy
 from diagnostic_msgs.msg import DiagnosticArray
-from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
+from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rcl_interfaces.srv import SetParameters
 from rclpy.parameter import Parameter
@@ -19,6 +19,7 @@ from std_msgs.msg import Float32, Header
 from tf2_msgs.msg import TFMessage
 from tf2_ros import StaticTransformBroadcaster
 import yaml
+from tracking_fixture import TrackingFixture
 
 
 def xyz(vector):
@@ -123,9 +124,7 @@ def test_height_bounds_tf_and_pose_agree(
     node = rclpy.create_node("height_bounds_test")
     odom_pub = node.create_publisher(Odometry, "/Odometry_loc", 10)
     scan_pub = node.create_publisher(PointCloud2, "/cloud_registered_1", 10)
-    reset_pub = node.create_publisher(
-        PoseWithCovarianceStamped, "/initialpose", 10
-    )
+    tracking = TrackingFixture(node)
     output_offset = (0.0, 0.0, 0.2) if all_axes else (0.0, 0.0, 0.0)
     static_broadcaster = StaticTransformBroadcaster(node)
     if all_axes:
@@ -257,12 +256,10 @@ def test_height_bounds_tf_and_pose_agree(
 
             def pump_until(
                 predicate,
-                reset_x=None,
                 z=0.0,
                 scans=True,
                 xy=(0.0, 0.0),
                 orientation=(0.0, 0.0, 0.0, 1.0),
-                reset_yaw=0.0,
             ):
                 deadline = time.monotonic() + 15.0
                 while time.monotonic() < deadline:
@@ -279,18 +276,12 @@ def test_height_bounds_tf_and_pose_agree(
                         odom.pose.pose.orientation.z,
                         odom.pose.pose.orientation.w,
                     ) = orientation
+                    tracking.publish(stamp)
                     odom_pub.publish(odom)
                     if scans:
                         scan_pub.publish(
                             create_cloud_xyz32(odom.header, points)
                         )
-                    if reset_x is not None:
-                        reset = PoseWithCovarianceStamped()
-                        reset.header = Header(stamp=stamp, frame_id="map")
-                        reset.pose.pose.position.x = reset_x
-                        reset.pose.pose.orientation.z = math.sin(reset_yaw / 2)
-                        reset.pose.pose.orientation.w = math.cos(reset_yaw / 2)
-                        reset_pub.publish(reset)
                     spin_deadline = time.monotonic() + 0.05
                     while time.monotonic() < spin_deadline:
                         rclpy.spin_once(node, timeout_sec=0.005)
@@ -341,40 +332,11 @@ def test_height_bounds_tf_and_pose_agree(
                 transforms.clear()
                 expected = bounded_height if bounds_enabled else z - floor_z
                 pump_until(lambda: consistent(z, expected), z=z, scans=False)
-            # A manual pose reset must preserve the current valid height.
-            poses.clear()
-            transforms.clear()
-            expected = 0.35 if bounds_enabled else -0.55 - floor_z
-            pump_until(
-                lambda: consistent(-0.55, expected, expected_x=0.1),
-                reset_x=0.1,
-                z=-0.55,
-                scans=False,
-            )
-            # A reset with articulated body attitude creates a genuinely
-            # rotated map/odom correction. Horizontal motion then changes Z.
+            # Check articulated body orientation and lateral motion without a
+            # reset; reset recovery now has separate integration coverage.
             attitude = quaternion_product(
-                quaternion_product(
-                    (0, 0, math.sin(0.05), math.cos(0.05)),
-                    (0, math.sin(-0.075), 0, math.cos(-0.075)),
-                ),
+                (0, math.sin(-0.075), 0, math.cos(-0.075)),
                 (math.sin(0.1), 0, 0, math.cos(0.1)),
-            )
-            poses.clear()
-            transforms.clear()
-            pump_until(
-                lambda: consistent(
-                    -0.55,
-                    expected,
-                    expected_x=0.1,
-                    orientation=attitude,
-                    expected_yaw=0.4,
-                ),
-                reset_x=0.1,
-                reset_yaw=0.4,
-                z=-0.55,
-                orientation=attitude,
-                scans=False,
             )
             for xy in ((3.0, 3.0), (-3.0, -3.0)):
                 before = last_correction[0]
@@ -388,42 +350,27 @@ def test_height_bounds_tf_and_pose_agree(
                     if bounds_enabled
                     else raw_height
                 )
-                poses.clear()
-                transforms.clear()
-                pump_until(
-                    lambda: consistent(
-                        -0.55,
-                        expected,
-                        expected_x=None,
+                for _ in range(2):
+                    poses.clear()
+                    transforms.clear()
+                    pump_until(
+                        lambda: consistent(
+                            -0.55,
+                            expected,
+                            expected_x=None,
+                            xy=xy,
+                            orientation=attitude,
+                        ),
+                        z=-0.55,
                         xy=xy,
                         orientation=attitude,
-                    ),
-                    z=-0.55,
-                    xy=xy,
-                    orientation=attitude,
-                    scans=False,
-                )
+                        scans=False,
+                    )
                 after = last_correction[0]
                 assert xyz(after.translation)[:2] == pytest.approx(
                     xyz(before.translation)[:2], abs=1e-9
                 )
                 assert_quaternion(after.rotation, quaternion(before.rotation))
-                # Check persistence on a subsequent filter prediction.
-                poses.clear()
-                transforms.clear()
-                pump_until(
-                    lambda: consistent(
-                        -0.55,
-                        expected,
-                        expected_x=None,
-                        xy=xy,
-                        orientation=attitude,
-                    ),
-                    z=-0.55,
-                    xy=xy,
-                    orientation=attitude,
-                    scans=False,
-                )
             if bounds_enabled:
                 assert any(
                     status.name == "open3d_loc/height_bounds"

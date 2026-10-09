@@ -78,7 +78,7 @@ class ImuProcess
   V3D angvel_last;
   V3D acc_s_last;
   double start_timestamp_;
-  double last_lidar_end_time_;
+  double last_lidar_end_time_ = -1.0;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -115,6 +115,12 @@ void ImuProcess::Reset()
   has_last_gyro_measurement_ = false;
   imu_need_init_    = true;
   start_timestamp_  = -1;
+  last_lidar_end_time_ = -1.0;
+  acc_s_last = Zero3d;
+  b_first_frame_ = true;
+  cov_acc = cov_acc_scale;
+  cov_gyr = cov_gyr_scale;
+  if (fout_imu.is_open()) fout_imu.close();
   init_iter_num     = 1;
   v_imu_.clear();
   IMUpose.clear();
@@ -232,6 +238,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   init_P(21,21) = init_P(22,22) = 0.00001; 
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
+  last_lidar_end_time_ = meas.lidar_end_time;
 
 }
 

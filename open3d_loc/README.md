@@ -232,10 +232,11 @@ warning and an error status named `localization_registration` on
 `/localization_3d_diagnostics` explain the failure.
 
 Use RViz **2D Pose Estimate** with the fixed frame set to `map` to reset the
-robot's position and heading. The reset forces a new map crop; registration
-resumes when the crop and scan are usable. This behavior applies with fusion
-enabled or disabled. Odometry continues during map loss, but the global pose
-remains based on the existing correction until reset or successful registration.
+robot's position and heading. Every accepted pose request resets FAST-LIO and its local map, then forces a
+new global map crop. Registration resumes after fresh local tracking and three
+qualifying global scans. This applies with fusion enabled or disabled. During
+reset the nodes republish historical outputs with their original timestamps;
+see the full reset workflow below.
 
 The `test_registration_reset` regression uses a synthetic map and ROS inputs
 to check startup outside the map, map loss after successful registration, and
@@ -250,3 +251,104 @@ recovery through `/initialpose` in both fusion modes.
 | `/localization_3d_odom` | Fused map-frame output pose with covariance. |
 | `/localization_3d_diagnostics` | Fusion/recovery state, gates, candidate consistency, applied steps, and overrun count. |
 | `/localization_3d_confidence` | Published registration fitness. |
+
+## FAST-LIO tracking loss and full pose reset
+
+Both nodes must run the updated versions together. Global localization waits
+for `/fast_lio/tracking_status` and processes only scans/odometry associated
+with an accepted FAST-LIO measurement. A bounded history of 32 accepted stamps
+handles sensor topics arriving behind status, and one pending message per input
+handles data arriving before status. The history is cleared on loss and reset;
+duplicate or older odometry cannot roll the pose back. Repeated held scans cannot
+satisfy initialization: three distinct, quality-qualified scans are required.
+`fusion.min_information_ratio` defaults to `1e-4` and checks the normalized
+point-to-plane information matrix in both initialization and tracking. Global
+geometry is evaluated around the matched cloud center so moving the map or
+odometry origin does not change the observability decision. Scan snapshots
+carry the fusion generation; registration cannot combine a pre-reset scan
+with post-reset estimator state.
+
+FAST-LIO reports `INITIALIZING`, `TRACKING`, `DEGRADED`, or `LOST` on the reliable,
+transient-local `/fast_lio/tracking_status` topic. `/fast_lio/diagnostics` exposes
+feature count, residual RMS, information ratio, velocity, biases, gravity,
+last IMU interval, map size, and prediction age. Poor measurements cannot
+partially update the EKF or insert/prune the local map. IMU prediction is
+limited to 0.5 seconds without an accepted LiDAR correction; a short interruption
+requires three qualifying scans to resume tracking. Longer losses, timing
+faults, and implausible states latch `LOST` until reset. Startup also requires
+usable IMU timing and a spatially nondegenerate seed scan. After deskewed scans
+first become available, initialization has the same prediction timeout. Single-plane scans
+and poorly constrained corridors can therefore remain degraded or lost.
+The IMU subscription uses the default best-effort, volatile `SensorDataQoS`
+profile, without overriding its queue depth.
+
+During loss and reset, the nodes republish their last trusted pose/TF/cloud
+outputs with **the original timestamps**, including the original twist and
+covariance. These are historical measurements, not a stationary constraint or
+fresh localization. Navigation can detect stale transforms; receiving repeated
+messages does not authorize motion. No new bundle exists before initialization.
+The height bounds remain active but do not repair the local estimator or
+indicate healthy tracking.
+
+Holding these outputs does not itself pause a Nav2 goal or block velocity
+commands. Nav2 may encounter stale-transform failures and attempt recovery
+before aborting. A command gate that checks localization health and measurement
+age is still needed for an immediate, predictable navigation stop.
+
+Every valid `/initialpose` now performs a full coordinated reset, even while
+tracking is healthy. Provide frame `map`, finite XY, and a finite nonzero
+quaternion. The request specifies body XY and yaw; Z retains the last trusted
+body height (or configured initial height before a trusted estimate exists),
+within enabled height bounds. Roll/pitch come from fresh gravity initialization.
+Initialize with the robot stationary and the LiDAR unobstructed. The reset
+clears FAST-LIO's state/covariance, IMU initialization and timing,
+buffers, local map, and matching caches. Global scan/motion/recovery histories
+and in-flight ICP results are invalidated. After fresh local tracking resumes,
+the coordinator seeds `map -> odom` from the requested body pose and requires
+three qualifying global scans before publishing fresh localization. Local
+odometry may change origin during a full reset. A request still needs to be
+close enough to the map for local ICP to converge.
+
+The equivalent operator service retains the last trusted map-frame body pose:
+
+```bash
+ros2 service call /localization/reset_tracking std_srvs/srv/Trigger '{}'
+```
+
+A successful response means the request was accepted, not that relocalization
+has finished. Monitor tracking status and `/localization_3d_diagnostics` for
+failures. The `open3d_loc/reset_tracking` diagnostic reports `reset_requested`,
+`reset_in_progress`, `waiting_for_local_tracking`,
+`waiting_for_global_registration`, and `relocalization_complete`; failed resets
+report an error state. Repeated pose
+requests are serialized; only the newest pending pose is used. Reset-service
+failure or a five-second acknowledgment timeout keeps outputs held until a
+new operator request. The backend `/fast_lio/reset_tracking` service is also
+available; its success message begins with `reset_generation=<integer>; instance_id=<integer>;` so
+the coordinator can wait for the acknowledged estimator instance and generation. Instance IDs also prevent
+a backend process restart from being confused with delayed status from the old process.
+An independently restarted or reset backend also invalidates global initialization;
+fresh global poses remain held until three new global registrations succeed.
+Initialization confirmation timestamps restart with each generation, allowing
+recovery when sensor time restarts at an earlier value.
+Stationary constraints and automatic full resets are not enabled.
+
+The new FAST-LIO protection parameters are startup-only and default to:
+
+```yaml
+tracking:
+  min_features: 100
+  min_feature_ratio: 0.2
+  max_residual_rms: 0.15
+  min_information_ratio: 0.0001
+  max_imu_gap: 0.05
+  prediction_timeout: 0.5
+  max_speed: 3.0
+  max_angular_speed: 3.0
+```
+
+Distances are metres and times are seconds. Angular speed is radians/second.
+Pose-change guards include tolerances of 0.1 m and 0.1 rad. Rotational Jacobian
+columns are normalized by scan radius before checking observability. Validate
+these new limits with recorded healthy and obstructed scans before hardware
+rollout; existing maps, extrinsics, noise values, and height settings are unchanged.

@@ -1,4 +1,9 @@
 #include <rclcpp/rclcpp.hpp>
+#include <fast_lio/msg/tracking_status.hpp>
+#include <fast_lio/tracking_guard.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <atomic>
+#include <unordered_set>
 #include <rclcpp/wait_for_message.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -40,6 +45,7 @@
 #include "open3d_loc/transform_utils.hpp"
 #include "open3d_loc/global_correction_filter.hpp"
 #include "open3d_loc/height_bounds.hpp"
+#include "registration_geometry.hpp"
 
 #define PI 3.1415926
 
@@ -299,6 +305,167 @@ private:
     Eigen::Matrix4d mat_initialpose_;
 
     std::mutex lock_state_;
+    rclcpp::Subscription<fast_lio::msg::TrackingStatus>::SharedPtr tracking_sub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr reset_client_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
+    rclcpp::TimerBase::SharedPtr reset_timer_;
+    std::atomic<bool> tracking_ready_{false};
+    std::atomic<bool> reset_pending_{false};
+    std::atomic<bool> reinitialize_requested_{false};
+    std::uint64_t tracking_generation_ = 0, reset_serial_ = 0;
+    std::uint64_t tracking_instance_ = 0, expected_reset_instance_ = 0;
+    std::unordered_set<std::uint64_t> retired_instances_;
+    bool tracking_seen_ = false, reset_inflight_ = false, reset_acknowledged_ = false, reset_failed_ = false;
+    std::uint64_t reset_started_generation_ = 0, expected_reset_generation_ = 0;
+    std::int64_t reset_request_id_ = 0;
+    rclcpp::Time accepted_tracking_stamp_{0, 0, RCL_ROS_TIME};
+    std::deque<rclcpp::Time> accepted_tracking_stamps_;
+    std::chrono::steady_clock::time_point reset_sent_;
+    Eigen::Matrix4d pending_body_pose_ = Eigen::Matrix4d::Identity();
+    Eigen::Matrix4d trusted_body_pose_ = Eigen::Matrix4d::Identity();
+    bool have_trusted_body_pose_ = false;
+    double min_information_ratio_ = 1e-4;
+
+    nav_msgs::msg::Odometry::SharedPtr pending_odometry_;
+    sensor_msgs::msg::PointCloud2::SharedPtr pending_scan_;
+    std::uint64_t latest_scan_generation_ = 0;
+    bool IsAcceptedTrackingStamp(const builtin_interfaces::msg::Time & stamp) const
+    {
+        const rclcpp::Time time(stamp);
+        return std::find(accepted_tracking_stamps_.begin(), accepted_tracking_stamps_.end(),
+            time) != accepted_tracking_stamps_.end();
+    }
+    void DrainTrackingInputs()
+    {
+        if (!tracking_ready_ || (reset_pending_ && (!reset_acknowledged_ || reset_failed_))) return;
+        if (pending_odometry_ && IsAcceptedTrackingStamp(pending_odometry_->header.stamp)) {
+            auto message = pending_odometry_;
+            pending_odometry_.reset();
+            CallbackBaselink2Odom(message);
+        }
+        if (!reset_pending_ && pending_scan_ &&
+            IsAcceptedTrackingStamp(pending_scan_->header.stamp)) {
+            auto message = pending_scan_;
+            pending_scan_.reset();
+            CallbackScan(message);
+        }
+    }
+    std::vector<std::function<void()>> held_publications_;
+    template<typename Message>
+    void PublishRemember(const typename rclcpp::Publisher<Message>::SharedPtr & publisher,
+        const Message & message)
+    {
+        publisher->publish(message);
+        held_publications_.push_back([publisher, message]() {publisher->publish(message);});
+    }
+    void RememberTransform(const geometry_msgs::msg::TransformStamped & transform)
+    {
+        br_odom2map_->sendTransform(transform);
+        held_publications_.push_back([this, transform]() {br_odom2map_->sendTransform(transform);});
+    }
+
+    void ClearScanHistory()
+    {
+        std::lock_guard<std::mutex> lock(lock_scan_);
+        que_pcd_scan_ = {};
+        pcd_scan_cur_->Clear();
+        latest_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        last_processed_scan_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    }
+
+    void ReportResetStatus(std::uint8_t level, const std::string & reason)
+    {
+        diagnostic_msgs::msg::DiagnosticArray diagnostics;
+        diagnostics.header.stamp = now();
+        diagnostic_msgs::msg::DiagnosticStatus status;
+        status.name = "open3d_loc/reset_tracking";
+        status.hardware_id = "open3d_loc";
+        status.level = level;
+        status.message = reason;
+        status.values.push_back(DiagnosticValue("reason", reason));
+        diagnostics.status.push_back(std::move(status));
+        pub_fusion_diagnostics_->publish(diagnostics);
+    }
+
+    void DispatchReset()
+    {
+        if (reset_inflight_ || !reset_pending_ || reset_acknowledged_ || reset_failed_) return;
+        if (!reset_client_->service_is_ready()) return;
+        reset_inflight_ = true;
+        ReportResetStatus(1, "reset_in_progress");
+        reset_sent_ = std::chrono::steady_clock::now();
+        const auto serial = reset_serial_;
+        reset_started_generation_ = tracking_generation_;
+        auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+        auto pending = reset_client_->async_send_request(request,
+            [this, serial](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
+                reset_inflight_ = false;
+                if (serial != reset_serial_) {DispatchReset(); return;}
+                auto response = future.get();
+                if (!response->success) {
+                    reset_acknowledged_ = true;
+                    reset_failed_ = true;
+                    ReportRegistrationFailure("FAST-LIO reset failed: " + response->message);
+                    ReportResetStatus(2, "backend_reset_failed");
+                    return;
+                }
+                try {
+                    const std::string prefix = "reset_generation=";
+                    if (response->message.rfind(prefix, 0) != 0)
+                        throw std::invalid_argument("missing reset generation");
+                    std::size_t consumed = 0;
+                    expected_reset_generation_ = std::stoull(response->message.substr(prefix.size()), &consumed);
+                    const std::string instance_prefix = "; instance_id=";
+                    const auto instance_offset = response->message.find(instance_prefix);
+                    if (instance_offset == std::string::npos)
+                        throw std::invalid_argument("missing estimator instance");
+                    expected_reset_instance_ = std::stoull(
+                        response->message.substr(instance_offset + instance_prefix.size()));
+                    if (expected_reset_generation_ == 0)
+                        throw std::invalid_argument("invalid reset generation");
+                } catch (const std::exception & error) {
+                    reset_failed_ = true;
+                    ReportRegistrationFailure(std::string("Invalid FAST-LIO reset acknowledgment: ") + error.what());
+                    ReportResetStatus(2, "invalid_reset_acknowledgment");
+                }
+                reset_acknowledged_ = true;
+                if (!reset_failed_) ReportResetStatus(1, "waiting_for_local_tracking");
+                RCLCPP_INFO(get_logger(), "FAST-LIO reset acknowledged; waiting for new tracking generation");
+            });
+        reset_request_id_ = pending.request_id;
+    }
+
+    void BeginReset(const Eigen::Matrix4d & desired)
+    {
+        pending_body_pose_ = desired;
+        ++reset_serial_;
+        reset_pending_ = true;
+        reset_acknowledged_ = false;
+        reset_failed_ = false;
+        reset_wait_started_ = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(lock_state_);
+            ++fusion_generation_;
+            loc_initialized_ = false;
+            loc_fitness_ = 0.0;
+            have_odom_ = false;
+            last_fusion_prediction_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+            accepted_tracking_stamps_.clear();
+            motion_history_.clear();
+            cumulative_odom_distance_ = 0.0;
+            cumulative_odom_rotation_ = 0.0;
+            force_submap_refresh_ = true;
+            correction_filter_.reset(mat_odom2map_);
+        }
+        ClearScanHistory();
+        pending_odometry_.reset(); pending_scan_.reset();
+        ReportRegistrationFailure("reset_requested; holding last trusted localization");
+        ReportResetStatus(1, "reset_requested");
+        DispatchReset();
+    }
+
+    std::chrono::steady_clock::time_point reset_wait_started_;
+
 
     /// @brief baselink和运动中心
     Eigen::Matrix4d mat_baselink2motionlink_;
@@ -528,6 +695,114 @@ GloabalLocalization::GloabalLocalization() : Node("global_loc_node"),
         "/cloud_registered_1", 50, std::bind(&GloabalLocalization::CallbackScan, this, std::placeholders::_1));
     sub_initialpose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/initialpose", 50, std::bind(&GloabalLocalization::CallbackInitialPose, this, std::placeholders::_1));
+
+    rcl_interfaces::msg::ParameterDescriptor information_descriptor;
+    information_descriptor.read_only = true;
+    information_descriptor.description = "Startup-only point-to-plane observability gate";
+    min_information_ratio_ = declare_parameter<double>("fusion.min_information_ratio", 1e-4, information_descriptor);
+    if (!std::isfinite(min_information_ratio_) || min_information_ratio_ <= 0.0 ||
+        min_information_ratio_ > 1.0) throw std::invalid_argument("invalid fusion.min_information_ratio");
+    reset_client_ = create_client<std_srvs::srv::Trigger>("/fast_lio/reset_tracking");
+    tracking_sub_ = create_subscription<fast_lio::msg::TrackingStatus>(
+        "/fast_lio/tracking_status", rclcpp::QoS(1).reliable().transient_local(),
+        [this](fast_lio::msg::TrackingStatus::ConstSharedPtr status) {
+            bool invalidate = false;
+            {
+                std::lock_guard<std::mutex> lock(lock_state_);
+                const bool new_instance = tracking_seen_ && status->instance_id != tracking_instance_;
+                if (new_instance && retired_instances_.count(status->instance_id)) return;
+                if (!new_instance && tracking_seen_ && status->generation < tracking_generation_) return;
+                if (new_instance) retired_instances_.insert(tracking_instance_);
+                const bool ready = status->state == fast_lio::msg::TrackingStatus::TRACKING;
+                invalidate = new_instance || tracking_generation_ != status->generation || (tracking_ready_ && !ready);
+                if (invalidate) {
+                    ++fusion_generation_;
+                    accepted_tracking_stamps_.clear();
+                    force_submap_refresh_ = true;
+                    motion_history_.clear();
+                    if (new_instance || tracking_generation_ != status->generation) {
+                        have_odom_ = false;
+                        loc_initialized_ = false;
+                        loc_fitness_ = 0.0;
+                        cumulative_odom_distance_ = 0.0;
+                        cumulative_odom_rotation_ = 0.0;
+                        last_fusion_prediction_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+                        if (!reset_pending_) {
+                            pending_body_pose_ = have_trusted_body_pose_ ? trusted_body_pose_ : mat_baselink2map_;
+                            reset_pending_ = true;
+                            reset_acknowledged_ = true;
+                            reset_started_generation_ = tracking_generation_;
+                            expected_reset_generation_ = status->generation;
+                            expected_reset_instance_ = status->instance_id;
+                        }
+                    }
+                }
+                if (!tracking_seen_ || tracking_generation_ != status->generation || tracking_ready_ != ready)
+                    RCLCPP_INFO(get_logger(), "FAST-LIO tracking state=%u generation=%lu reset_pending=%d",
+                        status->state, static_cast<unsigned long>(status->generation), bool(reset_pending_));
+                tracking_instance_ = status->instance_id;
+                tracking_seen_ = true;
+                tracking_generation_ = status->generation;
+                accepted_tracking_stamp_ = status->last_accepted_stamp;
+                tracking_ready_ = ready;
+                if (ready && accepted_tracking_stamp_.nanoseconds() > 0 &&
+                    (accepted_tracking_stamps_.empty() ||
+                    accepted_tracking_stamp_ > accepted_tracking_stamps_.back())) {
+                    accepted_tracking_stamps_.push_back(accepted_tracking_stamp_);
+                    if (accepted_tracking_stamps_.size() > 32) accepted_tracking_stamps_.pop_front();
+                }
+            }
+            if (invalidate) {
+                ClearScanHistory();
+                pending_odometry_.reset(); pending_scan_.reset();
+            }
+            if (invalidate && !tracking_ready_)
+                ReportRegistrationFailure("upstream tracking unavailable: " + status->reason);
+            DrainTrackingInputs();
+        });
+    reset_service_ = create_service<std_srvs::srv::Trigger>("/localization/reset_tracking",
+        [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+            std_srvs::srv::Trigger::Response::SharedPtr response) {
+            Eigen::Matrix4d desired;
+            {
+                std::lock_guard<std::mutex> lock(lock_state_);
+                desired = have_trusted_body_pose_ ? trusted_body_pose_ : mat_initialpose_;
+                if (!have_trusted_body_pose_ && height_bounds_.enabled)
+                    desired(2, 3) = height_bounds_.floor_z + std::clamp(
+                    mat_initialpose_(2, 3) - height_bounds_.floor_z,
+                    height_bounds_.min_height, height_bounds_.max_height);
+            }
+            BeginReset(desired);
+            response->success = true;
+            response->message = "Reset accepted; relocalization completion is reported through diagnostics";
+        });
+    reset_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {
+        if (reset_inflight_ &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - reset_sent_).count() > 5.0) {
+            reset_client_->remove_pending_request(reset_request_id_);
+            reset_inflight_ = false;
+            ++reset_serial_;
+            reset_acknowledged_ = true;
+            reset_failed_ = true;
+            ReportRegistrationFailure("FAST-LIO reset service timeout; reset remains unavailable");
+            ReportResetStatus(2, "backend_reset_timeout");
+        }
+        if (reset_pending_ && !reset_acknowledged_ &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - reset_wait_started_).count() > 5.0) {
+            reset_acknowledged_ = true;
+            reset_failed_ = true;
+            ReportRegistrationFailure("FAST-LIO reset service unavailable; retry initialpose after restoring service");
+            ReportResetStatus(2, "backend_reset_unavailable");
+        }
+        DispatchReset();
+        DrainTrackingInputs();
+        bool hold;
+        {
+            std::lock_guard<std::mutex> lock(lock_state_);
+            hold = !tracking_ready_ || reset_pending_ || !loc_initialized_;
+        }
+        if (hold) for (const auto & publish : held_publications_) publish();
+    });
 
     pose_baselink2odom_ = nav_msgs::msg::Odometry();
     pose_baselink2odom_.header.frame_id = "odom";
@@ -858,6 +1133,25 @@ bool GloabalLocalization::GetTfTransformToMatrix(
 
 void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::SharedPtr baselink2odom)
 {
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        if (!tracking_ready_ || !IsAcceptedTrackingStamp(baselink2odom->header.stamp)) {
+            if (!pending_odometry_ || rclcpp::Time(baselink2odom->header.stamp) >
+                rclcpp::Time(pending_odometry_->header.stamp)) pending_odometry_ = baselink2odom;
+            return;
+        }
+        // Historical retransmissions and late older messages must not roll
+        // back the body pose or advance the scalar filters repeatedly.
+        if (have_odom_ && rclcpp::Time(baselink2odom->header.stamp) <=
+            last_fusion_prediction_stamp_) return;
+        if (reset_pending_ && (reset_failed_ || !reset_acknowledged_ || (tracking_instance_ != expected_reset_instance_ || tracking_generation_ < expected_reset_generation_))) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "Waiting for reset: generation=%lu expected=%lu acknowledged=%d failed=%d",
+                static_cast<unsigned long>(tracking_generation_),
+                static_cast<unsigned long>(expected_reset_generation_), reset_acknowledged_, reset_failed_);
+            return;
+        }
+    }
     Eigen::Matrix4d mat_body_to_imu = Eigen::Matrix4d::Identity();
     if (!GetTfTransformToMatrix(body_frame_, imu_frame_, baselink2odom->header.stamp, mat_body_to_imu))
     {
@@ -948,7 +1242,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
             }
         }
 
-        if (fusion_enabled_ && correction_filter_.initialized())
+        if (loc_initialized_ && fusion_enabled_ && correction_filter_.initialized())
         {
             correction_filter_.predict(std::max(dt, 0.0), distance, rotation);
             mat_odom2map_ = correction_filter_.pose();
@@ -959,6 +1253,34 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         mat_baselink2motionlink_ = mat_body_to_output;
         mat_baselink2odom_ = mat_body_to_odom;
         have_odom_ = true;
+        if (reset_pending_) {
+            // Keep fresh gravity roll/pitch and apply only the requested map yaw.
+            const double desired_yaw = std::atan2(pending_body_pose_(1, 0), pending_body_pose_(0, 0));
+            const double local_yaw = std::atan2(mat_body_to_odom(1, 0), mat_body_to_odom(0, 0));
+            Eigen::Matrix4d desired = pending_body_pose_;
+            desired.block<3, 3>(0, 0) =
+                open3d_loc::levelOrientationFromYaw(desired_yaw - local_yaw) *
+                mat_body_to_odom.block<3, 3>(0, 0);
+            mat_odom2map_ = desired * mat_body_to_odom.inverse();
+            mat_initialpose_ = mat_odom2map_;
+            mat_odom2map_kalman_ = mat_odom2map_;
+            correction_filter_.reset(mat_odom2map_);
+            ++fusion_generation_;
+            last_fusion_prediction_stamp_ = odom_stamp;
+            fusion_rejection_count_ = 0;
+            const auto position = desired.block<3, 1>(0, 3);
+            if (kf_param_x_.size() >= 2 && kf_param_y_.size() >= 2 && kf_param_z_.size() >= 2) {
+                kf_baselink_x_.KalmanFilterInit(kf_param_x_[0], kf_param_x_[1], position.x(), 1);
+                kf_baselink_y_.KalmanFilterInit(kf_param_y_[0], kf_param_y_[1], position.y(), 1);
+                kf_baselink_z_.KalmanFilterInit(kf_param_z_[0], kf_param_z_[1], position.z(), 1);
+            }
+            kalman_filter_odom2map_.KalmanFilterInit(kalman_processVar2_, kalman_estimatedMeasVar2_, mat_odom2map_(2, 3), 1);
+            RCLCPP_INFO(get_logger(), "Fresh post-reset odometry received; starting global relocalization");
+            ReportResetStatus(1, "waiting_for_global_registration");
+            reset_pending_ = false;
+            reinitialize_requested_ = true;
+            force_submap_refresh_ = true;
+        }
         ApplyHeightBoundsLocked();
 
         mat_odom_to_map = mat_odom2map_;
@@ -979,6 +1301,10 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
             pub_fusion_diagnostics_->publish(diagnostics);
         }
         localization_initialized = loc_initialized_;
+        if (localization_initialized) {
+            trusted_body_pose_ = mat_baselink2map_;
+            have_trusted_body_pose_ = true;
+        }
         localization_fitness = loc_fitness_;
         if (fusion_enabled_ && correction_filter_.initialized())
         {
@@ -1010,6 +1336,8 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         timestamp_odom_ = baselink2odom->header.stamp;
     }
 
+    if (!localization_initialized) return;
+    held_publications_.clear();
     // ICP updates map -> odom asynchronously, so differentiating this map-frame
     // pose would create correction spikes rather than a physical body twist.
     Eigen::Isometry3d Isometry3d_baselink2map;
@@ -1020,7 +1348,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
     baselink2map.child_frame_id = body_frame_;
     baselink2map.header.stamp = baselink2odom->header.stamp;
     SetRosPoseCovariance(fused_pose_covariance, baselink2map);
-    pub_baselink2map_->publish(baselink2map);
+    PublishRemember(pub_baselink2map_, baselink2map);
 
     Eigen::Isometry3d Isometry3d_odom2map;
     Isometry3d_odom2map.matrix() = mat_odom_to_map;
@@ -1030,7 +1358,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
     odom2map.child_frame_id = "odom";
     odom2map.header.stamp = baselink2odom->header.stamp;
     SetRosPoseCovariance(correction_covariance, odom2map);
-    pub_odom2map_->publish(odom2map);
+    PublishRemember(pub_odom2map_, odom2map);
 
     /// 发布tf关系
     geometry_msgs::msg::TransformStamped transform_odom2map;
@@ -1041,7 +1369,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
     transform_odom2map.transform.translation.y = odom2map.pose.pose.position.y;
     transform_odom2map.transform.translation.z = odom2map.pose.pose.position.z;
     transform_odom2map.transform.rotation = odom2map.pose.pose.orientation;
-    br_odom2map_->sendTransform(transform_odom2map);
+    RememberTransform(transform_odom2map);
 
     if (publish_robot_root_tf_)
     {
@@ -1056,7 +1384,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         transform_body2odom.transform.translation.y = body_pose.position.y;
         transform_body2odom.transform.translation.z = body_pose.position.z;
         transform_body2odom.transform.rotation = body_pose.orientation;
-        br_odom2map_->sendTransform(transform_body2odom);
+        RememberTransform(transform_body2odom);
     }
 
     /// 卡尔曼滤波 - 只在定位初始化完成后执行
@@ -1071,7 +1399,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
             odom2map_kalman.header.frame_id = "map";
             odom2map_kalman.child_frame_id = "odom_kalman";
             odom2map_kalman.header.stamp = baselink2odom->header.stamp;
-            pub_odom2map_kalman_->publish(odom2map_kalman);
+            PublishRemember(pub_odom2map_kalman_, odom2map_kalman);
         }
         Eigen::Isometry3d Isometry3d_baselink2map_kalman;
         Isometry3d_baselink2map_kalman.matrix() = mat_body_to_map_filtered;
@@ -1081,7 +1409,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         baselink2map_kalman.child_frame_id = body_frame_;
         // baselink2map_kalman.child_frame_id = "base_link_kalman";
         baselink2map_kalman.header.stamp = baselink2odom->header.stamp;
-        pub_baselink2map_kalman_->publish(baselink2map_kalman);
+        PublishRemember(pub_baselink2map_kalman_, baselink2map_kalman);
 
         if (!output_transform_valid)
             return;
@@ -1097,7 +1425,7 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         // baselink2map_kalman.child_frame_id = "base_link_kalman";
         motionlink2map.header.stamp = baselink2odom->header.stamp;
         SetRosPoseCovariance(fused_pose_covariance, motionlink2map);
-        pub_motionlink2map_->publish(motionlink2map);
+        PublishRemember(pub_motionlink2map_, motionlink2map);
 
         /// 发布tf关系
         geometry_msgs::msg::TransformStamped transform;
@@ -1110,32 +1438,43 @@ void GloabalLocalization::CallbackBaselink2Odom(const nav_msgs::msg::Odometry::S
         transform.transform.rotation = motionlink2map.pose.pose.orientation;
         if (publish_output_tf_)
         {
-            br_odom2map_->sendTransform(transform);
+            RememberTransform(transform);
         }
 
         localization_3d_confidence_.data = localization_fitness;
-        pub_localization_3d_confidence_->publish(localization_3d_confidence_);
+        PublishRemember(pub_localization_3d_confidence_, localization_3d_confidence_);
         localization_3d_delay_ms_.data = (this->now() - baselink2odom->header.stamp).seconds() * 1000.0;
-        pub_localization_3d_delay_ms_->publish(localization_3d_delay_ms_);
+        PublishRemember(pub_localization_3d_delay_ms_, localization_3d_delay_ms_);
         localization_3d_.header.frame_id = "map";
         localization_3d_.header.stamp = baselink2odom->header.stamp;
         localization_3d_.pose = motionlink2map.pose.pose;
-        pub_localization_3d_->publish(localization_3d_);
+        PublishRemember(pub_localization_3d_, localization_3d_);
         nav_msgs::msg::Odometry localization_3d_odom = motionlink2map;
-        pub_localization_3d_odom_->publish(localization_3d_odom);
+        PublishRemember(pub_localization_3d_odom_, localization_3d_odom);
     }
 }
 void GloabalLocalization::CallbackScan(
     const sensor_msgs::msg::PointCloud2::SharedPtr scan_in_baselink)
 {
+    {
+        std::lock_guard<std::mutex> lock(lock_state_);
+        if (!tracking_ready_ || reset_pending_ ||
+            !IsAcceptedTrackingStamp(scan_in_baselink->header.stamp)) {
+            if (!pending_scan_ || rclcpp::Time(scan_in_baselink->header.stamp) >
+                rclcpp::Time(pending_scan_->header.stamp)) pending_scan_ = scan_in_baselink;
+            return;
+        }
+    }
     open3d::geometry::PointCloud pcd_recieved;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr const_scan_ptr = scan_in_baselink;
     open3d_conversions::rosToOpen3d(const_scan_ptr, pcd_recieved);
-    std::lock_guard<std::mutex> lock(lock_scan_);
+    std::scoped_lock lock(lock_state_, lock_scan_);
+    if (rclcpp::Time(scan_in_baselink->header.stamp) <= latest_scan_stamp_) return;
     if (que_pcd_scan_.size() >= static_cast<std::size_t>(queue_maxsize_))
         que_pcd_scan_.pop();
     que_pcd_scan_.push(std::move(pcd_recieved));
     latest_scan_stamp_ = scan_in_baselink->header.stamp;
+    latest_scan_generation_ = fusion_generation_;
 
     if (que_pcd_scan_.size() == static_cast<std::size_t>(queue_maxsize_))
     {
@@ -1181,29 +1520,42 @@ void GloabalLocalization::LocalizationInitialize()
     double fitness_initial; /// overlap
     double loc_cost = 0;    /// 定位耗时(ms)
     int count_success = 0;
+    rclcpp::Time last_confirmation(0, 0, RCL_ROS_TIME);
+    std::uint64_t confirmation_generation = 0;
     while (rclcpp::ok())
     {
+        if (!tracking_ready_ || reset_pending_) {
+            count_success = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
         auto loc_s = std::chrono::high_resolution_clock::now(); /// 开始定位计时
-        lock_scan_.lock();
-        if (pcd_scan_cur_->IsEmpty())
+        Eigen::Matrix4d reg_matrix = Eigen::Matrix4d::Identity();
+        bool have_fresh_scan = false;
         {
-            lock_scan_.unlock();
+            std::scoped_lock lock(lock_state_, lock_scan_);
+            if (confirmation_generation != fusion_generation_) {
+                count_success = 0;
+                last_confirmation = rclcpp::Time(0, 0, RCL_ROS_TIME);
+                confirmation_generation = fusion_generation_;
+            }
+            have_fresh_scan = tracking_ready_ && !reset_pending_ &&
+                latest_scan_generation_ == confirmation_generation &&
+                !pcd_scan_cur_->IsEmpty() && latest_scan_stamp_ > last_confirmation;
+            if (have_fresh_scan) {
+                *pcd_scan = *pcd_scan_cur_;
+                last_confirmation = latest_scan_stamp_;
+                mat_baselink2odom_cur = mat_baselink2odom_;
+                mat_baselink2map_cur = mat_baselink2map_;
+                reg_matrix = mat_odom2map_;
+            }
+        }
+        if (!have_fresh_scan) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
         else
         {
-            *pcd_scan = *pcd_scan_cur_;
-            lock_scan_.unlock();
-
-            Eigen::Matrix4d reg_matrix = Eigen::Matrix4d::Identity();
-            {
-                std::lock_guard<std::mutex> lock(lock_state_);
-                mat_baselink2odom_cur = mat_baselink2odom_;
-                mat_baselink2map_cur = mat_baselink2map_;
-                reg_matrix = mat_odom2map_;
-            }
-
             try
             {
                 /// 将cropbox转换到对应位置进行裁剪点云
@@ -1243,6 +1595,12 @@ void GloabalLocalization::LocalizationInitialize()
                 auto eva_result_coarse = open3d::pipelines::registration::EvaluateRegistration(*source, *target, voxelsize_fine_ * 3);
                 open3d::utility::LogInfo("eva fitness: {}", eva_result_coarse.fitness_);
                 fitness_initial = eva_result_coarse.fitness_;
+                if (eva_result_coarse.correspondence_set_.size() < static_cast<std::size_t>(fusion_min_correspondences_) ||
+                    !std::isfinite(eva_result_coarse.inlier_rmse_) ||
+                    eva_result_coarse.inlier_rmse_ > fusion_max_icp_rmse_ ||
+                    open3d_loc::pointToPlaneInformationRatio(*source, *target, eva_result_coarse,
+                        Eigen::Matrix4d::Identity()) < min_information_ratio_)
+                    fitness_initial = 0.0;
                 *pcd_scan2map = *source;
 
             }
@@ -1262,13 +1620,36 @@ void GloabalLocalization::LocalizationInitialize()
             {
                 {
                     std::lock_guard<std::mutex> lock(lock_state_);
+                    if (confirmation_generation != fusion_generation_ || !tracking_ready_ || reset_pending_) {
+                        count_success = 0;
+                        continue;
+                    }
                     mat_odom2map_ = reg_matrix;
                     ApplyHeightBoundsLocked();
                 }
                 count_success += 1;
-                /// 连续两次定位成功后定位初始化成功
-                if (count_success >= 2)
+                // Require three distinct scans from the same estimator epoch.
+                if (count_success >= 3)
                 {
+                    std::lock_guard<std::mutex> lock(lock_state_);
+                    if (confirmation_generation != fusion_generation_ || !tracking_ready_ || reset_pending_) {
+                        count_success = 0;
+                        continue;
+                    }
+                    const auto position = mat_baselink2map_.block<3, 1>(0, 3);
+                    if (kf_param_x_.size() >= 2 && kf_param_y_.size() >= 2 && kf_param_z_.size() >= 2) {
+                        kf_baselink_x_.KalmanFilterInit(kf_param_x_[0], kf_param_x_[1], position.x(), 1);
+                        kf_baselink_y_.KalmanFilterInit(kf_param_y_[0], kf_param_y_[1], position.y(), 1);
+                        kf_baselink_z_.KalmanFilterInit(kf_param_z_[0], kf_param_z_[1], position.z(), 1);
+                    }
+                    kalman_filter_odom2map_.KalmanFilterInit(
+                        kalman_processVar2_, kalman_estimatedMeasVar2_, mat_odom2map_(2, 3), 1);
+                    correction_filter_.reset(mat_odom2map_);
+                    ++fusion_generation_;
+                    loc_initialized_ = true;
+                    reinitialize_requested_ = false;
+                    ReportResetStatus(0, "relocalization_complete");
+                    RCLCPP_INFO(get_logger(), "Localization initialization complete, Kalman filters ready");
                     break;
                 }
             }
@@ -1324,55 +1705,6 @@ void GloabalLocalization::Localization()
     }
     LocalizationInitialize();
 
-    /// 卡尔曼滤波初始化
-    /// 使用当前 baselink2map 位置初始化卡尔曼滤波器
-    Eigen::Matrix4d init_baselink2map = Eigen::Matrix4d::Identity();
-    {
-        std::lock_guard<std::mutex> lock(lock_state_);
-        init_baselink2map = mat_odom2map_ * mat_baselink2odom_;
-    }
-    double init_x = init_baselink2map(0, 3);
-    double init_y = init_baselink2map(1, 3);
-    double init_z = init_baselink2map(2, 3);
-
-    RCLCPP_INFO(this->get_logger(), "Initializing Kalman filters with position: x=%.3f, y=%.3f, z=%.3f",
-                init_x, init_y, init_z);
-
-    {
-        std::lock_guard<std::mutex> lock(lock_state_);
-        // 检查参数数组大小是否有效
-        if (kf_param_x_.size() >= 2 && kf_param_y_.size() >= 2 && kf_param_z_.size() >= 2)
-        {
-            kf_baselink_x_.KalmanFilterInit(kf_param_x_[0], kf_param_x_[1], init_x, 1);
-            kf_baselink_y_.KalmanFilterInit(kf_param_y_[0], kf_param_y_[1], init_y, 1);
-            kf_baselink_z_.KalmanFilterInit(kf_param_z_[0], kf_param_z_[1], init_z, 1);
-            RCLCPP_INFO(this->get_logger(), "Kalman filters initialized: x[%.6f,%.6f], y[%.6f,%.6f], z[%.6f,%.6f]",
-                        kf_param_x_[0], kf_param_x_[1], kf_param_y_[0], kf_param_y_[1],
-                        kf_param_z_[0], kf_param_z_[1]);
-        }
-        else
-        {
-            RCLCPP_ERROR(this->get_logger(), "Invalid Kalman filter parameters! x_size=%zu, y_size=%zu, z_size=%zu",
-                         kf_param_x_.size(), kf_param_y_.size(), kf_param_z_.size());
-            RCLCPP_ERROR(this->get_logger(), "Kalman filters will NOT be initialized - using default values");
-        }
-
-        kalman_filter_odom2map_.KalmanFilterInit(kalman_processVar2_, kalman_estimatedMeasVar2_, init_z, 1);
-        if (fusion_enabled_)
-        {
-            correction_filter_.reset(mat_odom2map_);
-            ++fusion_generation_;
-            {
-                std::lock_guard<std::mutex> timestamp_lock(lock_timestamp_);
-                last_fusion_prediction_stamp_ = timestamp_odom_;
-            }
-            fusion_rejection_count_ = 0;
-        }
-        loc_initialized_ = true;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "Localization initialization complete, Kalman filters ready");
-
     auto coordinate_ori = open3d::geometry::TriangleMesh::CreateCoordinateFrame(2.0);
     auto coordinate_loc = open3d::geometry::TriangleMesh::CreateCoordinateFrame(2.0);
     auto coordinate_OBB_scan = open3d::geometry::TriangleMesh::CreateCoordinateFrame(2.0);
@@ -1411,6 +1743,15 @@ void GloabalLocalization::Localization()
     while (rclcpp::ok())
     {
 
+        if (!tracking_ready_ || reset_pending_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        if (reinitialize_requested_.exchange(false)) {
+            LocalizationInitialize();
+            RCLCPP_INFO(get_logger(), "Coordinated reset relocalization complete");
+            continue;
+        }
         lock_timestamp_.lock();
         time_current = timestamp_odom_;
         lock_timestamp_.unlock();
@@ -1455,6 +1796,7 @@ void GloabalLocalization::Localization()
             bool force_submap_refresh = false;
 
             scan_stamp = latest_scan_stamp_;
+            const auto scan_generation = latest_scan_generation_;
             if (scan_stamp.nanoseconds() <= last_processed_scan_stamp_.nanoseconds())
             {
                 lock_scan_.unlock();
@@ -1468,6 +1810,9 @@ void GloabalLocalization::Localization()
             Eigen::Matrix4d reg_matrix = Eigen::Matrix4d::Identity();
             {
                 std::lock_guard<std::mutex> lock(lock_state_);
+                // A reset can occur between the scan copy and this snapshot.
+                if (!loc_initialized_ || !tracking_ready_ || reset_pending_ ||
+                    scan_generation != fusion_generation_) continue;
                 if (!fusion_enabled_ && filter_odom2map_)
                 {
                     kalman_filter_odom2map_.inputLatestNoisyMeasurement(mat_odom2map_(2, 3));
@@ -1578,7 +1923,7 @@ void GloabalLocalization::Localization()
                 if (fusion_enabled_)
                 {
                     std::string rejection_reason;
-                    if (fusion_generation != fusion_generation_)
+                    if (!tracking_ready_ || reset_pending_ || fusion_generation != fusion_generation_)
                         rejection_reason = "reset_during_registration";
                     else if (localization_fitness <= threshold_fitness_)
                         rejection_reason = "fitness_gate";
@@ -1587,6 +1932,9 @@ void GloabalLocalization::Localization()
                         rejection_reason = "rmse_gate";
                     else if (correspondence_count < static_cast<std::size_t>(fusion_min_correspondences_))
                         rejection_reason = "correspondence_gate";
+                    else if (open3d_loc::pointToPlaneInformationRatio(*source, *target, eva_result2,
+                        reg_matrix) < min_information_ratio_)
+                        rejection_reason = "degenerate_geometry";
                     else if (!std::isfinite(measurement_age) || measurement_age < 0.0 ||
                         measurement_age > fusion_max_measurement_age_)
                         rejection_reason = "stale_measurement";
@@ -1654,7 +2002,11 @@ void GloabalLocalization::Localization()
                             correspondence_count, measurement_age);
                     }
                 }
-                else if (localization_fitness > threshold_fitness_)
+                else if (tracking_ready_ && !reset_pending_ && fusion_generation == fusion_generation_ &&
+                    localization_fitness > threshold_fitness_ &&
+                    correspondence_count >= static_cast<std::size_t>(fusion_min_correspondences_) &&
+                    eva_result2.inlier_rmse_ <= fusion_max_icp_rmse_ &&
+                    open3d_loc::pointToPlaneInformationRatio(*source, *target, eva_result2, reg_matrix) >= min_information_ratio_)
                 {
                     mat_odom2map_ = reg_matrix;
                     ApplyHeightBoundsLocked();
@@ -1802,80 +2154,35 @@ void GloabalLocalization::StartLoc()
 
 void GloabalLocalization::CallbackInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr initialpose)
 {
-    if (!initialpose->header.frame_id.empty() && initialpose->header.frame_id != "map")
-    {
-        RCLCPP_ERROR(this->get_logger(), "Ignoring initial pose in frame '%s'; expected 'map'",
-                     initialpose->header.frame_id.c_str());
+    const auto & pose = initialpose->pose.pose;
+    Eigen::Quaterniond quaternion(pose.orientation.w, pose.orientation.x,
+        pose.orientation.y, pose.orientation.z);
+    if (initialpose->header.frame_id != "map" || !std::isfinite(pose.position.x) ||
+        !std::isfinite(pose.position.y) || !quaternion.coeffs().allFinite() ||
+        !std::isfinite(quaternion.norm()) || quaternion.norm() < 1e-9) {
+        RCLCPP_ERROR(get_logger(), "Invalid initialpose: expected finite XY, nonzero quaternion and map frame");
         return;
     }
-
-    Eigen::Matrix4d desired_body_to_map = Eigen::Matrix4d::Identity();
-    Eigen::Matrix4d corrected_odom_to_map = Eigen::Matrix4d::Identity();
+    quaternion.normalize();
+    const Eigen::Matrix3d rotation = quaternion.toRotationMatrix();
+    const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+    Eigen::Matrix4d desired;
     {
         std::lock_guard<std::mutex> lock(lock_state_);
-        if (!have_odom_)
-        {
-            RCLCPP_WARN(this->get_logger(), "Ignoring initial pose until the first valid odometry/TF update");
-            return;
-        }
-
-        desired_body_to_map = mat_baselink2map_;
-        desired_body_to_map(0, 3) = initialpose->pose.pose.position.x;
-        desired_body_to_map(1, 3) = initialpose->pose.pose.position.y;
-
-        tf2::Quaternion clicked_quaternion;
-        tf2::fromMsg(initialpose->pose.pose.orientation, clicked_quaternion);
-        double clicked_roll = 0.0, clicked_pitch = 0.0, clicked_yaw = 0.0;
-        tf2::Matrix3x3(clicked_quaternion).getRPY(clicked_roll, clicked_pitch, clicked_yaw);
-        (void)clicked_roll;
-        (void)clicked_pitch;
-
-        // RViz 2D Pose Estimate represents a level base_link in the map frame.
-        // Retaining a bad initial roll/pitch would make an inverted start permanent.
-        desired_body_to_map.block<3, 3>(0, 0) =
-            open3d_loc::levelOrientationFromYaw(clicked_yaw);
-
-        // RViz provides T_map_base. FAST-LIO provides T_odom_base, so solve for T_map_odom.
+        desired = have_trusted_body_pose_ ? trusted_body_pose_ : mat_initialpose_;
+        if (!have_trusted_body_pose_ && height_bounds_.enabled)
+            desired(2, 3) = height_bounds_.floor_z + std::clamp(
+                    mat_initialpose_(2, 3) - height_bounds_.floor_z,
+                    height_bounds_.min_height, height_bounds_.max_height);
         if (height_bounds_.enabled)
-        {
-            const double height = desired_body_to_map(2, 3) - height_bounds_.floor_z;
-            desired_body_to_map(2, 3) = height_bounds_.floor_z +
-                std::clamp(height, height_bounds_.min_height, height_bounds_.max_height);
-        }
-        corrected_odom_to_map = desired_body_to_map * mat_baselink2odom_.inverse();
-        mat_initialpose_ = corrected_odom_to_map;
-        mat_odom2map_ = corrected_odom_to_map;
-        mat_odom2map_kalman_ = corrected_odom_to_map;
-        mat_baselink2map_ = desired_body_to_map;
-        force_submap_refresh_ = true;
-        if (fusion_enabled_)
-        {
-            correction_filter_.reset(corrected_odom_to_map);
-            ++fusion_generation_;
-            {
-                std::lock_guard<std::mutex> timestamp_lock(lock_timestamp_);
-                last_fusion_prediction_stamp_ = timestamp_odom_;
-            }
-            fusion_rejection_count_ = 0;
-        }
-
-        if (kf_param_x_.size() >= 2 && kf_param_y_.size() >= 2 && kf_param_z_.size() >= 2)
-        {
-            const Eigen::Vector3d position = desired_body_to_map.block<3, 1>(0, 3);
-            kf_baselink_x_.KalmanFilterInit(kf_param_x_[0], kf_param_x_[1], position.x(), 1);
-            kf_baselink_y_.KalmanFilterInit(kf_param_y_[0], kf_param_y_[1], position.y(), 1);
-            kf_baselink_z_.KalmanFilterInit(kf_param_z_[0], kf_param_z_[1], position.z(), 1);
-            kalman_filter_odom2map_.KalmanFilterInit(
-                kalman_processVar2_, kalman_estimatedMeasVar2_, corrected_odom_to_map(2, 3), 1);
-        }
-
-        loc_fitness_ = 0.0;
+            desired(2, 3) = height_bounds_.floor_z + std::clamp(
+                desired(2, 3) - height_bounds_.floor_z, height_bounds_.min_height, height_bounds_.max_height);
     }
-
-    RCLCPP_INFO(this->get_logger(),
-                "Reinitialized %s pose from RViz: x=%.3f y=%.3f z=%.3f",
-                body_frame_.c_str(), desired_body_to_map(0, 3),
-                desired_body_to_map(1, 3), desired_body_to_map(2, 3));
+    desired(0, 3) = pose.position.x;
+    desired(1, 3) = pose.position.y;
+    desired.block<3, 3>(0, 0) = open3d_loc::levelOrientationFromYaw(yaw);
+    BeginReset(desired);
+    RCLCPP_INFO(get_logger(), "Initialpose accepted: resetting FAST-LIO before relocalization");
 }
 
 bool GloabalLocalization::LookupMotionSampleLocked(
